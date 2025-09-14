@@ -451,15 +451,15 @@ class MainWindow(QMainWindow):
 
     def load_styles(self):
         try:
-            # Determine the base directory for finding assets
+            # Determine the base directory for finding assets robustly
             if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
                 # Bundled application (e.g., PyInstaller)
                 base_dir = sys._MEIPASS
-                style_path = os.path.join(base_dir, 'assets', 'styles.qss')
             else:
-                # Running from source (assuming ui/ is sibling to assets/)
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                style_path = os.path.normpath(os.path.join(script_dir, '..', 'assets', 'styles.qss'))
+                # Running from source
+                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+            style_path = os.path.join(base_dir, 'assets', 'styles.qss')
             
             if os.path.exists(style_path):
                 with open(style_path, "r", encoding="utf-8") as f:

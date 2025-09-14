@@ -1,3 +1,4 @@
+# core/hotkeys.py
 import sys
 import logging
 from pynput import keyboard
@@ -15,19 +16,16 @@ def convert_qt_to_pynput(qt_key_str: str) -> str:
     for part in parts:
         part = part.strip().lower()
         if part in ["ctrl", "shift", "alt", "meta", "cmd", "win"]:
-            # Handle platform specific mapping
             if sys.platform == "darwin":
-                 if part == "ctrl": pynput_parts.append("<cmd>") # Qt Ctrl usually means Cmd on Mac
-                 elif part == "meta": pynput_parts.append("<ctrl>") # Qt Meta usually means Ctrl on Mac
+                 if part == "ctrl": pynput_parts.append("<cmd>")
+                 elif part == "meta": pynput_parts.append("<ctrl>")
                  else: pynput_parts.append(f"<{part}>")
             else:
                  if part == "meta": pynput_parts.append("<win>")
                  else: pynput_parts.append(f"<{part}>")
         elif len(part) > 1:
-             # Function keys (F1, F2) or others (Home, End)
              pynput_parts.append(f"<{part}>")
         else:
-            # Single characters
             pynput_parts.append(part)
     
     return '+'.join(pynput_parts)
@@ -45,21 +43,26 @@ class HotkeyListener(QObject):
     @Slot()
     def start_listening(self):
         """Starts or restarts the listener. Must be called in the worker thread."""
+        # This method is now robust against crashes
         if self.listener:
+            logger.info("Stopping existing hotkey listener...")
             self.listener.stop()
+            # The listener thread will exit, making it safe to start a new one.
+            logger.info("Existing listener stopped.")
         
         self.load_hotkeys()
 
         if not self.hotkey_map:
-            logger.info("No hotkeys configured. Listener not starting.")
+            logger.warning("No hotkeys configured. Listener is not starting.")
             return
 
         try:
+            logger.info(f"Starting new hotkey listener for: {list(self.hotkey_map.keys())}")
             self.listener = keyboard.GlobalHotKeys(self.hotkey_map)
             self.listener.start()
-            logger.info(f"Hotkey listener started. Listening for: {list(self.hotkey_map.keys())}")
+            logger.info("New hotkey listener started successfully.")
         except Exception as e:
-            logger.error(f"Failed to start global hotkey listener: {e}")
+            logger.error(f"Failed to start global hotkey listener: {e}", exc_info=True)
             self.show_permission_warning(e)
 
     def load_hotkeys(self):
@@ -79,11 +82,9 @@ class HotkeyListener(QObject):
         if self.listener:
             self.listener.stop()
             self.listener = None
-            logger.info("Hotkey listener stopped.")
+            logger.info("Hotkey listener stopped cleanly via stop_listening slot.")
 
     def show_permission_warning(self, error):
-        # This function runs in the worker thread, so cannot show QMessageBox directly.
-        # It should ideally emit a signal back to the main thread.
         if sys.platform == "darwin":
             logger.error("macOS 權限錯誤：請確保已在「系統設定 > 安全性與隱私權 > 輔助使用」中授權此應用程式或終端機。")
         elif sys.platform == "win32":
@@ -101,18 +102,17 @@ class HotkeyManager(QObject):
         self.thread = QThread()
         self.listener = HotkeyListener()
         
-        # Move the listener to the dedicated thread
         self.listener.moveToThread(self.thread)
         
-        # Connect signals
         self.thread.started.connect(self.listener.start_listening)
         self.listener.hotkey_triggered.connect(self.handle_trigger)
+        
+        # === FINAL FIX: Re-enable the connection for reloading hotkeys ===
         settings_manager.settings_changed.connect(self.reload_hotkeys)
         
         self.thread.start()
 
     def handle_trigger(self, action: str):
-        # Relay the signal from the listener thread to the main thread
         if action == "F2":
             self.trigger_f2.emit()
         elif action == "F3":
@@ -122,8 +122,9 @@ class HotkeyManager(QObject):
 
     def reload_hotkeys(self):
         """Safely reloads hotkeys by invoking the method in the listener's thread."""
+        logger.info("Settings changed, queuing hotkey listener restart.")
         if self.thread.isRunning():
-            # Use invokeMethod to ensure start_listening runs in the correct thread context
+            # Use invokeMethod to ensure start_listening runs safely in the correct thread context
             QMetaObject.invokeMethod(self.listener, "start_listening", Qt.ConnectionType.QueuedConnection)
 
     def stop(self):

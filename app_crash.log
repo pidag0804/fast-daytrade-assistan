@@ -1,0 +1,11 @@
+2025-09-14 11:22:43,052 - INFO - ui.main_window - Initialized ThreadPool with 24 threads.
+2025-09-14 11:22:43,058 - INFO - core.hotkeys - Starting new hotkey listener for: ['<f2>', '<f3>', '<f4>']
+2025-09-14 11:22:43,059 - INFO - ui.main_window - 就緒
+2025-09-14 11:22:43,320 - INFO - core.hotkeys - New hotkey listener started successfully.
+2025-09-14 11:22:50,385 - INFO - core.hotkeys - Settings changed, queuing hotkey listener restart.
+2025-09-14 11:22:50,386 - INFO - core.hotkeys - Stopping existing hotkey listener...
+2025-09-14 11:22:50,386 - INFO - core.hotkeys - Existing listener stopped.
+2025-09-14 11:22:50,387 - INFO - core.hotkeys - Starting new hotkey listener for: ['<f2>', '<f3>', '<f4>']
+2025-09-14 11:22:50,395 - INFO - core.hotkeys - New hotkey listener started successfully.
+2025-09-14 11:23:33,198 - INFO - ui.main_window - Shutting down application...
+2025-09-14 11:23:33,233 - INFO - AppStartup - Event loop closed.

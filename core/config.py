@@ -41,23 +41,35 @@ class SettingsManager(QObject):
 
     def __init__(self):
         super().__init__()
-        # QSettings uses Organization/Application name (Set in app.py)
-        self.settings = QSettings()
+        # 1. Defer QSettings initialization
+        self._settings = None
+        self._migrated = False  # Flag to ensure migration runs only once
         self._default_save_path = os.path.join(
             QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation), 
             self.SERVICE_NAME
         )
-        self._migrate_old_settings()
+
+    @property
+    def settings(self):
+        """Lazy initializer for QSettings to ensure it's created after QApplication details are set."""
+        if self._settings is None:
+            # This is the first time settings are accessed. 
+            # By now, app.py should have configured the application name.
+            self._settings = QSettings()
+            if not self._migrated:
+                self._migrate_old_settings()
+                self._migrated = True
+        return self._settings
 
     def _migrate_old_settings(self):
         """Migrates settings from the old structure (v1) if necessary."""
-        # Migrate old OpenAI settings (like Strategy/Timeout) to new AI/ prefix if they exist
+        # This now correctly uses the lazy-loaded self.settings property
         if self.settings.contains("OpenAI/Strategy"):
             print("Migrating old AI settings structure...")
             # Use self.get to respect existing values or use defaults if missing
             self.set("AI/Strategy", self.get("OpenAI/Strategy"))
             self.set("AI/Timeout", self.get("OpenAI/Timeout"))
-            self.set("AI/MaxImages", self.get("OpenAI/MaxImages"))
+            self.set("AI/MaxImages", self.get("AI/MaxImages"))
             # Remove old keys that are now generalized
             self.settings.remove("OpenAI/Strategy")
             self.settings.remove("OpenAI/Timeout")
@@ -92,8 +104,7 @@ class SettingsManager(QObject):
                 keyring.set_password(self.SERVICE_NAME, key_name, key)
         except Exception as e:
             raise RuntimeError(f"無法安全儲存 {provider} API Key: {e}")
-        # Emit change signal as API key changes affect other components
-        self.settings_changed.emit()
+        # The signal will be emitted once by save_and_emit() in the settings dialog
 
     # --- General Settings (QSettings) ---
     
@@ -102,6 +113,7 @@ class SettingsManager(QObject):
             # If no default provided, try to fetch from DEFAULTS dictionary
             default = self.DEFAULTS.get(key)
         
+        # Access self.settings through the property to ensure it's initialized
         value = self.settings.value(key, default)
         
         # Handle type conversion (QSettings often stores bool/int as strings)
@@ -109,7 +121,7 @@ class SettingsManager(QObject):
             # Use the type from the DEFAULTS dict for accurate conversion
             default_type = type(self.DEFAULTS.get(key))
             if default_type is bool:
-                return value == 'true' or value is True
+                return str(value).lower() == 'true' or value is True
             if default_type is int:
                 try:
                     return int(value)
@@ -119,10 +131,12 @@ class SettingsManager(QObject):
         return value
 
     def set(self, key, value):
+        # Access self.settings through the property
         self.settings.setValue(key, value)
 
     def save_and_emit(self):
         """Syncs settings to disk and emits the change signal."""
+        # Access self.settings through the property
         self.settings.sync()
         self.settings_changed.emit()
 

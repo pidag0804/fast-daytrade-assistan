@@ -1,169 +1,224 @@
 # core/config.py
+from __future__ import annotations
+
 import os
-import sys
+from typing import Any, Dict, Optional
+
 import keyring
 from PySide6.QtCore import QSettings, QStandardPaths, QObject, Signal
 
+
+def _to_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+
 class SettingsManager(QObject):
-    """Manages application settings and secure storage."""
     settings_changed = Signal()
-    
+
+    ORG_NAME = "FastDaytradeTools"
     SERVICE_NAME = "FastDaytradeAssistant"
-    # Update API Key names to be provider-specific
+
     OPENAI_API_KEY_NAME = "OpenAI_APIKey"
     GEMINI_API_KEY_NAME = "Gemini_APIKey"
 
-    # Default Settings (Updated structure)
-    DEFAULTS = {
+    DEFAULTS: Dict[str, Any] = {
+        # 一般
+        "General/AutoClearQueue": False,
+
+        # 熱鍵
         "Hotkeys/F2": "F2",
         "Hotkeys/F3": "F3",
         "Hotkeys/F4": "F4",
-        "Image/Format": "WebP",
-        "Image/MaxSize": 1600,
-        "Image/RetainOriginal": False,
-        
-        # New AI General Settings (Migrated from old OpenAI settings)
-        "AI/Provider": "OpenAI", # Default provider: OpenAI or Gemini
-        "AI/Strategy": "Auto",
-        "AI/Timeout": 15, # Increased default timeout slightly
-        "AI/MaxImages": 8,
 
-        # OpenAI Specific
+        # 圖片
+        "Image/Format": "PNG",
+        "Image/MaxSize": 2048,
+        "Image/RetainOriginal": True,
+
+        # AI（通用）
+        "AI/Provider": "OpenAI",
+        "AI/Strategy": "Auto",
+        "AI/Timeout": 60,        # 給 UI 使用
+        "AI/TimeoutSec": 60,     # 若舊程式用這個 key 也能相容
+        "AI/MaxImages": 5,
+
+        # OpenAI / Gemini 模型預設
         "OpenAI/ModelFast": "gpt-4o-mini",
         "OpenAI/ModelDeep": "gpt-4o",
-
-        # Gemini Specific (Using 1.5 Flash for speed and 1.5 Pro for depth)
-        "Gemini/ModelFast": "gemini-1.5-flash-latest",
-        "Gemini/ModelDeep": "gemini-1.5-pro-latest", # 可替換為 gemini-2.5-pro-latest
-
-        "General/AutoClearQueue": True,
+        "Gemini/ModelFast": "gemini-1.5-flash",
+        "Gemini/ModelDeep": "gemini-1.5-pro",
     }
 
-    def __init__(self):
-        super().__init__()
-        # 1. Defer QSettings initialization
-        self._settings = None
-        self._migrated = False  # Flag to ensure migration runs only once
-        self._default_save_path = os.path.join(
-            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation), 
-            self.SERVICE_NAME
-        )
+    def __init__(self, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self._settings: Optional[QSettings] = None
+        self._migrated: bool = False
 
     @property
-    def settings(self):
-        """Lazy initializer for QSettings to ensure it's created after QApplication details are set."""
+    def settings(self) -> QSettings:
         if self._settings is None:
-            # This is the first time settings are accessed. 
-            # By now, app.py should have configured the application name.
-            self._settings = QSettings()
+            self._settings = QSettings(
+                QSettings.IniFormat, QSettings.UserScope,
+                self.ORG_NAME, self.SERVICE_NAME
+            )
+            self._ensure_defaults()
             if not self._migrated:
-                self._migrate_old_settings()
-                self._migrated = True
+                try:
+                    self._migrate_old_settings()
+                finally:
+                    self._migrated = True
         return self._settings
 
-    def _migrate_old_settings(self):
-        """Migrates settings from the old structure (v1) if necessary."""
-        # This now correctly uses the lazy-loaded self.settings property
-        if self.settings.contains("OpenAI/Strategy"):
-            print("Migrating old AI settings structure...")
-            # Use self.get to respect existing values or use defaults if missing
-            self.set("AI/Strategy", self.get("OpenAI/Strategy"))
-            self.set("AI/Timeout", self.get("OpenAI/Timeout"))
-            self.set("AI/MaxImages", self.get("AI/MaxImages"))
-            # Remove old keys that are now generalized
-            self.settings.remove("OpenAI/Strategy")
-            self.settings.remove("OpenAI/Timeout")
-            self.settings.remove("OpenAI/MaxImages")
-            self.settings.sync()
+    # ---- 基本 API（型別安全） ----
+    def get(self, key: str, default: Any = None) -> Any:
+        if default is None and key in self.DEFAULTS:
+            default = self.DEFAULTS[key]
+        return self.settings.value(key, default)
 
-    # --- API Key (Keyring) - Generalized ---
-    
-    def _get_key_name(self, provider: str) -> str:
-        if provider == "OpenAI":
-            return self.OPENAI_API_KEY_NAME
-        elif provider == "Gemini":
-            return self.GEMINI_API_KEY_NAME
-        raise ValueError(f"Unknown provider: {provider}")
-
-    def get_api_key(self, provider: str) -> str | None:
+    def get_int(self, key: str, default: Optional[int] = None) -> int:
+        v = self.get(key, default)
         try:
-            key_name = self._get_key_name(provider)
-            return keyring.get_password(self.SERVICE_NAME, key_name)
+            return int(v)
+        except Exception:
+            return int(default or 0)
+
+    def get_float(self, key: str, default: Optional[float] = None) -> float:
+        v = self.get(key, default)
+        try:
+            return float(v)
+        except Exception:
+            return float(default or 0.0)
+
+    def get_bool(self, key: str, default: Optional[bool] = None) -> bool:
+        if default is None and key in self.DEFAULTS:
+            default = bool(self.DEFAULTS[key])
+        v = self.get(key, default)
+        return _to_bool(v)
+
+    def set(self, key: str, value: Any) -> None:
+        self.settings.setValue(key, value)
+
+    def set_many(self, pairs: Dict[str, Any]) -> None:
+        s = self.settings
+        for k, v in pairs.items():
+            s.setValue(k, v)
+
+    def remove(self, key: str) -> None:
+        self.settings.remove(key)
+
+    def clear_all(self) -> None:
+        self.settings.clear()
+        self.save_and_emit()
+
+    def save_and_emit(self) -> None:
+        if self._settings is not None:
+            self._settings.sync()
+        self._settings = None
+        self.settings_changed.emit()
+
+    # ---- 業務便利 ----
+    def get_hotkeys(self) -> Dict[str, str]:
+        return {
+            "F2": str(self.get("Hotkeys/F2")),
+            "F3": str(self.get("Hotkeys/F3")),
+            "F4": str(self.get("Hotkeys/F4")),
+        }
+
+    def get_image_settings(self) -> Dict[str, Any]:
+        return {
+            "format": str(self.get("Image/Format")),
+            "max_size": self.get_int("Image/MaxSize"),
+            "retain_original": self.get_bool("Image/RetainOriginal"),
+        }
+
+    # 儲存路徑
+    def _compute_default_save_dir(self) -> str:
+        pictures = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation)
+        documents = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+        base = pictures or documents or os.path.expanduser("~")
+        path = os.path.join(base, self.SERVICE_NAME)
+        return os.path.normpath(path)
+
+    def get_save_path(self) -> str:
+        path = str(self.get("Paths/SaveDir", "") or "").strip()
+        if not path:
+            path = self._compute_default_save_dir()
+            self.set("Paths/SaveDir", path)
+            if self._settings is not None:
+                self._settings.sync()
+        path = os.path.expandvars(os.path.expanduser(path))
+        os.makedirs(path, exist_ok=True)
+        return os.path.normpath(path)
+
+    def set_save_path(self, path: str) -> None:
+        if not path:
+            return
+        path = os.path.expandvars(os.path.expanduser(path))
+        os.makedirs(path, exist_ok=True)
+        self.set("Paths/SaveDir", os.path.normpath(path))
+
+    # ---- 金鑰（keyring） ----
+    def get_api_key(self, provider: str) -> Optional[str]:
+        name = self._key_name_for_provider(provider)
+        if not name:
+            return None
+        try:
+            return keyring.get_password(self.SERVICE_NAME, name)
         except Exception:
             return None
 
-    def set_api_key(self, provider: str, key: str):
+    def set_api_key(self, provider: str, value: Optional[str]) -> None:
+        name = self._key_name_for_provider(provider)
+        if not name:
+            return
         try:
-            key_name = self._get_key_name(provider)
-            if not key:
-                try:
-                    keyring.delete_password(self.SERVICE_NAME, key_name)
-                except keyring.errors.PasswordDeleteError:
-                    pass
+            if value:
+                keyring.set_password(self.SERVICE_NAME, name, value)
             else:
-                keyring.set_password(self.SERVICE_NAME, key_name, key)
-        except Exception as e:
-            raise RuntimeError(f"無法安全儲存 {provider} API Key: {e}")
-        # The signal will be emitted once by save_and_emit() in the settings dialog
+                keyring.delete_password(self.SERVICE_NAME, name)
+        except keyring.errors.PasswordDeleteError:
+            pass
+        except Exception:
+            pass
 
-    # --- General Settings (QSettings) ---
-    
-    def get(self, key, default=None):
-        if default is None:
-            # If no default provided, try to fetch from DEFAULTS dictionary
-            default = self.DEFAULTS.get(key)
-        
-        # Access self.settings through the property to ensure it's initialized
-        value = self.settings.value(key, default)
-        
-        # Handle type conversion (QSettings often stores bool/int as strings)
-        if key in self.DEFAULTS:
-            # Use the type from the DEFAULTS dict for accurate conversion
-            default_type = type(self.DEFAULTS.get(key))
-            if default_type is bool:
-                return str(value).lower() == 'true' or value is True
-            if default_type is int:
-                try:
-                    return int(value)
-                except (ValueError, TypeError):
-                    # If conversion fails, return the default value
-                    return default
-        return value
+    def _key_name_for_provider(self, provider: str) -> Optional[str]:
+        p = (provider or "").strip().lower()
+        if p in ("openai", "oai"):
+            return self.OPENAI_API_KEY_NAME
+        if p in ("gemini", "google", "vertex"):
+            return self.GEMINI_API_KEY_NAME
+        return None
 
-    def set(self, key, value):
-        # Access self.settings through the property
-        self.settings.setValue(key, value)
+    # ---- 初始化 / 遷移 ----
+    def _ensure_defaults(self) -> None:
+        s = self._settings
+        if s is None:
+            return
+        for k, v in self.DEFAULTS.items():
+            if s.value(k, None) is None:
+                s.setValue(k, v)
+        if s.value("Paths/SaveDir", None) is None:
+            s.setValue("Paths/SaveDir", self._compute_default_save_dir())
+        s.sync()
 
-    def save_and_emit(self):
-        """Syncs settings to disk and emits the change signal."""
-        # Access self.settings through the property
-        self.settings.sync()
-        self.settings_changed.emit()
+    def _migrate_old_settings(self) -> None:
+        """
+        遷移舊鍵：
+        - General/SavePath -> Paths/SaveDir
+        """
+        s = self._settings
+        if s is None:
+            return
+        old = s.value("General/SavePath", None)
+        if old:
+            s.setValue("Paths/SaveDir", old)
+            s.remove("General/SavePath")
+            s.sync()
 
-    # --- Specific Getters (get_save_path, get_hotkeys, get_image_settings 保持不變) ---
-    def get_save_path(self) -> str:
-        path = self.get("General/SavePath", self._default_save_path)
-        # Ensure the path exists
-        if not os.path.exists(path):
-            try:
-                os.makedirs(path, exist_ok=True)
-            except OSError:
-                return self._default_save_path # Fallback
-        return path
 
-    def get_hotkeys(self) -> dict[str, str]:
-        return {
-            "F2": self.get("Hotkeys/F2"),
-            "F3": self.get("Hotkeys/F3"),
-            "F4": self.get("Hotkeys/F4"),
-        }
-
-    def get_image_settings(self) -> dict:
-        return {
-            "format": self.get("Image/Format"),
-            "max_size": self.get("Image/MaxSize"),
-            "retain_original": self.get("Image/RetainOriginal"),
-        }
-
-# Global instance
 settings_manager = SettingsManager()

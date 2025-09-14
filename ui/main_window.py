@@ -1,487 +1,460 @@
 # ui/main_window.py
+from __future__ import annotations
+
 import sys
 import os
 import logging
 import asyncio
+import re
+from pathlib import Path
+
 import numpy as np
+from PySide6.QtCore import Qt, QTimer, QSize, QItemSelectionModel, QRect, QPoint
+from PySide6.QtGui import QKeySequence, QImage, QPixmap, QAction
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
-    QListView, QTextEdit, QPushButton, QToolBar, QStatusBar,
-    QApplication, QLabel, QMenu, QMessageBox, QScrollArea
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QListView,
+    QTextEdit, QPushButton, QToolBar, QStatusBar, QApplication, QLabel,
+    QMenu, QMessageBox, QScrollArea, QComboBox, QLineEdit, QFormLayout
 )
-from PySide6.QtCore import Qt, QThreadPool, Slot, QSize, QTimer, QUrl
-from PySide6.QtGui import QAction, QKeySequence, QDesktopServices, QImage
 
 from core.config import settings_manager
 from core.hotkeys import HotkeyManager
 from core.screenshot import capture_active_window, capture_region
-from core.imaging import ImageSaveWorker
 
-# Import the centralized AI manager
-from core.ai_client.manager import ai_manager 
+from core.imaging import ImageSaveOptions, save_image_async
+from core.ai_client.manager import ai_manager
 from core.models import AnalysisResult
 
-# Import THUMBNAIL_SIZE for consistent UI sizing
 from ui.queue_model import UploadQueueModel, THUMBNAIL_SIZE
 from ui.settings_dialog import SettingsDialog
 from ui.widgets import SnippingTool, AnalysisCard
-from ui.editor.editor_window import ImageEditorWindow
 
 logger = logging.getLogger(__name__)
+
+class _OverlaySnip(QWidget):
+    def __init__(self, on_done):
+        super().__init__(flags=Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowState(Qt.WindowFullScreen)
+        self._on_done = on_done
+        from PySide6.QtWidgets import QRubberBand
+        self._rubber = QRubberBand(QRubberBand.Rectangle, self)
+        self._origin = QPoint()
+        self.setCursor(Qt.CrossCursor)
+
+    def mousePressEvent(self, e):
+        self._origin = e.pos()
+        self._rubber.setGeometry(QRect(self._origin, self._origin))
+        self._rubber.show()
+
+    def mouseMoveEvent(self, e):
+        self._rubber.setGeometry(QRect(self._origin, e.pos()).normalized())
+
+    def mouseReleaseEvent(self, e):
+        rect = QRect(self._origin, e.pos()).normalized()
+        self._rubber.hide()
+        region = {"left": rect.left(), "top": rect.top(), "width": rect.width(), "height": rect.height()}
+        self.close()
+        self._on_done(region)
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        # Set basic window properties first
         self.setWindowTitle("股票當沖詢問工具 (Fast Daytrade Assistant)")
-        self.setGeometry(100, 100, 1300, 850)
+        self.resize(1300, 880)
 
-        # Use a try-except block during initialization to catch errors causing blank windows
-        try:
-            # Initialize QThreadPool for background image processing
-            self.threadpool = QThreadPool()
-            logger.info(f"Initialized ThreadPool with {self.threadpool.maxThreadCount()} threads.")
+        if not logger.handlers:
+            h = logging.StreamHandler()
+            h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+            logger.addHandler(h)
+            logger.setLevel(logging.INFO)
+        logger.propagate = False  # 避免重覆列印
 
-            # Initialize core components
-            self.hotkey_manager = HotkeyManager(self)
-            self.queue_model = UploadQueueModel(self)
-            self.snipping_tool = SnippingTool()
-            self.editor_window = None
-            self.original_window_state = None # For tracking state during screenshots
+        self.hotkey_manager = HotkeyManager(self)
+        self.queue_model = UploadQueueModel(self)
+        self.snipping_tool = SnippingTool()
+        self.editor_window = None
+        self._saved_state = None
 
-            # Setup the UI structure (Crucial for visibility)
-            self.setup_ui()
-            self.setup_toolbar()
-            self.connect_signals()
-            self.load_styles()
+        self._build_ui()
+        self._connect()
+        self.set_loading_state(False)
+        self.on_settings_changed()
+        logger.info("就緒")
 
-            # Initial load of settings display
-            self.on_settings_changed()
+    # ---------- UI ----------
+    def _build_ui(self):
+        main = QWidget(); self.setCentralWidget(main)
+        layout = QHBoxLayout(main)
+        splitter = QSplitter(Qt.Horizontal); layout.addWidget(splitter)
 
-        except Exception as e:
-            # If initialization fails, log it. The global handler in app.py will show the error.
-            logger.critical(f"Failed to initialize MainWindow: {e}", exc_info=True)
-            # Re-raise the exception to stop the application
-            raise
-
-    # --- UI Setup Methods (Must be complete) ---
-
-    def setup_ui(self):
-        # This is the core layout setup.
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout(main_widget)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter)
-
-        # These methods add widgets to the splitter
-        self.setup_queue_panel(splitter)
-        self.setup_chat_panel(splitter)
-
-        splitter.setSizes([350, 950])
-
-        self.statusBar = QStatusBar()
-        self.setStatusBar(self.statusBar)
-        self.update_status("就緒")
-
-    def setup_queue_panel(self, parent_splitter):
-        queue_panel = QWidget()
-        layout = QVBoxLayout(queue_panel)
-        layout.addWidget(QLabel("待上傳區 (可拖拉排序、多選)"))
-
+        # queue panel
+        qpanel = QWidget(); ql = QVBoxLayout(qpanel)
+        ql.addWidget(QLabel("待上傳區 (可拖曳排序、多選)"))
         self.queue_view = QListView()
         self.queue_view.setModel(self.queue_model)
-        # Use IconMode for better thumbnail display
-        self.queue_view.setViewMode(QListView.ViewMode.IconMode)
-        # Set icon size based on the thumbnail size defined in queue_model
+        self.queue_view.setViewMode(QListView.IconMode)
         self.queue_view.setIconSize(QSize(THUMBNAIL_SIZE, THUMBNAIL_SIZE))
         self.queue_view.setGridSize(QSize(THUMBNAIL_SIZE + 20, THUMBNAIL_SIZE + 30))
-        self.queue_view.setResizeMode(QListView.ResizeMode.Adjust)
-        self.queue_view.setSpacing(5)
-
-        # Enable Drag/Drop and Selection
+        self.queue_view.setResizeMode(QListView.Adjust)
+        self.queue_view.setSpacing(6)
         self.queue_view.setDragEnabled(True)
-        self.queue_view.setAcceptDrops(True)
+        self.queue_view.setAcceptDrops(True
+        )
         self.queue_view.setDropIndicatorShown(True)
-        self.queue_view.setDragDropMode(QListView.DragDropMode.InternalMove)
-        self.queue_view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
+        self.queue_view.setDragDropMode(QListView.InternalMove)
+        self.queue_view.setSelectionMode(QListView.ExtendedSelection)
+        self.queue_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.queue_view.customContextMenuRequested.connect(self._queue_menu)
+        ql.addWidget(self.queue_view)
+        splitter.addWidget(qpanel)
 
-        # Context Menu
-        self.queue_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.queue_view.customContextMenuRequested.connect(self.show_queue_context_menu)
+        # right panel
+        rpanel = QWidget(); rl = QVBoxLayout(rpanel)
 
-        layout.addWidget(self.queue_view)
-        parent_splitter.addWidget(queue_panel)
+        # result cards
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        self.results_container = QWidget(); self.results_layout = QVBoxLayout(self.results_container)
+        self.results_layout.setAlignment(Qt.AlignTop)
+        scroll.setWidget(self.results_container)
+        rl.addWidget(scroll, 1)
 
-    def setup_chat_panel(self, parent_splitter):
-        chat_panel = QWidget()
-        layout = QVBoxLayout(chat_panel)
-
-        # Results Display Area (Scrollable Container for Cards)
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        self.results_container = QWidget()
-        self.results_layout = QVBoxLayout(self.results_container)
-        self.results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        scroll_area.setWidget(self.results_container)
-        layout.addWidget(scroll_area, stretch=1)
-
-        # Input Area
-        self.user_input = QTextEdit()
-        self.user_input.setPlaceholderText("輸入補充說明（例如：目前持倉成本、特殊消息等）...")
+        # user note
+        self.user_input = QTextEdit(); self.user_input.setPlaceholderText("補充說明（例如持倉成本、消息）...")
         self.user_input.setMaximumHeight(80)
-        layout.addWidget(self.user_input)
+        rl.addWidget(self.user_input)
+
+        # meta row：股票代號/名稱 + 模式
+        meta_box = QWidget(); meta_form = QFormLayout(meta_box)
+        self.ed_symbol = QLineEdit(); self.ed_symbol.setPlaceholderText("例：2330")
+        self.ed_name = QLineEdit(); self.ed_name.setPlaceholderText("例：台積電")
+        meta_form.addRow("股票代號：", self.ed_symbol)
+        meta_form.addRow("股票名稱：", self.ed_name)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("分析模式："))
+        self.cb_mode = QComboBox(); self.cb_mode.addItems(["自動判斷", "當沖", "短波投資"])
+        saved_mode = str(settings_manager.get("AI/AnalysisMode") or "Auto")
+        idx = {"Auto": 0, "DayTrade": 1, "ShortSwing": 2}.get(saved_mode, 0)
+        self.cb_mode.setCurrentIndex(idx)
+        self.cb_mode.currentIndexChanged.connect(self._on_mode_changed)
+        mode_row.addWidget(self.cb_mode); mode_row.addStretch(1)
+
+        rl.addWidget(meta_box)
+        rl.addLayout(mode_row)
 
         self.send_button = QPushButton("送出分析請求")
         self.send_button.clicked.connect(self.send_analysis_request)
-        layout.addWidget(self.send_button)
+        rl.addWidget(self.send_button)
+        splitter.addWidget(rpanel)
 
-        parent_splitter.addWidget(chat_panel)
+        splitter.setSizes([360, 980])
 
-    def setup_toolbar(self):
-        toolbar = QToolBar("Main Toolbar")
-        self.addToolBar(toolbar)
+        # toolbar
+        tb = QToolBar("Main"); self.addToolBar(tb)
+        act_f2 = QAction("截當前視窗", self); act_f2.triggered.connect(lambda: self._trigger_screenshot("window")); tb.addAction(act_f2)
+        act_f3 = QAction("截並編輯", self); act_f3.triggered.connect(lambda: self._trigger_screenshot("edit")); tb.addAction(act_f3)
+        act_f4 = QAction("框選截圖", self); act_f4.triggered.connect(lambda: self._trigger_screenshot("region")); tb.addAction(act_f4)
+        tb.addSeparator()
+        act_clear = QAction("清空待上傳", self); act_clear.triggered.connect(self.queue_model.clear_queue); tb.addAction(act_clear)
+        act_settings = QAction("設定", self); act_settings.triggered.connect(self.open_settings); tb.addAction(act_settings)
 
-        self.action_f2 = QAction("截當前視窗", self)
-        self.action_f2.triggered.connect(lambda: self.trigger_screenshot('window'))
-        toolbar.addAction(self.action_f2)
+        # fallback shortcuts
+        for key, cb in (("F3", lambda: self._trigger_screenshot("edit")),
+                        ("F4", lambda: self._trigger_screenshot("region"))):
+            qs = QAction(self); qs.setShortcut(QKeySequence(key)); qs.triggered.connect(cb); self.addAction(qs)
 
-        self.action_f3 = QAction("截並編輯", self)
-        self.action_f3.triggered.connect(lambda: self.trigger_screenshot('edit'))
-        toolbar.addAction(self.action_f3)
+        self.statusBar = QStatusBar(); self.setStatusBar(self.statusBar)
 
-        self.action_f4 = QAction("框選截圖", self)
-        self.action_f4.triggered.connect(lambda: self.trigger_screenshot('region'))
-        toolbar.addAction(self.action_f4)
+    def _connect(self):
+        try:
+            self.hotkey_manager.trigger_f2.connect(lambda: self._trigger_screenshot("window"))
+            self.hotkey_manager.trigger_f3.connect(lambda: self._trigger_screenshot("edit"))
+            self.hotkey_manager.trigger_f4.connect(lambda: self._trigger_screenshot("region"))
+            self.hotkey_manager.start(["<f3>", "<f4>"])
+        except Exception as e:
+            logger.warning("全域熱鍵初始化失敗，將僅使用視窗內快捷鍵：%s", e)
 
-        toolbar.addSeparator()
+        try:
+            self.snipping_tool.snipping_finished.connect(self._handle_region_capture)
+        except Exception:
+            pass
 
-        action_clear = QAction("清空待上傳", self)
-        action_clear.triggered.connect(self.queue_model.clear_queue)
-        toolbar.addAction(action_clear)
-
-        action_settings = QAction("設定", self)
-        action_settings.triggered.connect(self.open_settings)
-        toolbar.addAction(action_settings)
-
-    def connect_signals(self):
-        # Hotkeys
-        self.hotkey_manager.trigger_f2.connect(lambda: self.trigger_screenshot('window'))
-        self.hotkey_manager.trigger_f3.connect(lambda: self.trigger_screenshot('edit'))
-        self.hotkey_manager.trigger_f4.connect(lambda: self.trigger_screenshot('region'))
-
-        # Snipping Tool
-        self.snipping_tool.snipping_finished.connect(self.handle_region_capture)
-
-        # Settings changes
         settings_manager.settings_changed.connect(self.on_settings_changed)
 
-    # --- Screenshot Logic ---
-
-    @Slot(str)
-    def trigger_screenshot(self, mode):
-        """Handles screenshot requests from hotkeys or toolbar."""
-        # Strategy: Minimize window briefly for reliability (Windows specific)
-        # This helps ensure we capture the intended foreground window, not our own app.
+    # ---------- 截圖 ----------
+    def _trigger_screenshot(self, mode: str):
         if sys.platform == "win32":
-            self.update_status(f"準備截圖 ({mode})...")
-            
-            # Store current state and minimize
-            self.original_window_state = self.windowState()
-            self.setWindowState(Qt.WindowState.WindowMinimized)
-            QApplication.processEvents() # Process the minimize event
-            
-            # Wait for OS focus shift/minimization animation
-            delay = 300 # milliseconds
+            self._saved_state = self.windowState()
+            self.setWindowState(Qt.WindowMinimized)
+            QApplication.processEvents()
+            delay = 300
         else:
-             # macOS/Linux: Minimization might be slower or unnecessary, use shorter delay
-             self.original_window_state = None
-             delay = 100
+            self._saved_state = None
+            delay = 120
 
-        if mode == 'region':
-                # Start the snipping tool after the delay
-                QTimer.singleShot(delay, self.snipping_tool.start)
-                # Window state will be restored in handle_region_capture
+        if mode == "region":
+            QTimer.singleShot(delay, self._start_snipping_tool)
         else:
-                # Execute capture after the delay
-                QTimer.singleShot(delay, lambda: self.execute_capture(mode))
+            QTimer.singleShot(delay, lambda: self._do_capture(mode))
 
-    def restore_window_state(self):
-        """Restores the window state if it was minimized for screenshot."""
-        if self.original_window_state is not None:
-            self.setWindowState(self.original_window_state)
+    def _restore_window(self):
+        if self._saved_state is not None:
+            self.setWindowState(self._saved_state)
             self.activateWindow()
-            self.original_window_state = None
+            self._saved_state = None
         elif self.isMinimized():
-            # Fallback if state tracking wasn't used (e.g., non-Windows platforms)
-            self.showNormal()
-            self.activateWindow()
+            self.showNormal(); self.activateWindow()
 
-    def execute_capture(self, mode):
-        # This runs after the delay (if any)
-        image_data = capture_active_window()
-        
-        # Restore window visibility
-        self.restore_window_state()
-
-        if image_data is not None:
-            if mode == 'edit':
-                self.open_editor(image_data)
-            else:
-                self.process_and_save(image_data)
-        else:
-            self.update_status("錯誤：無法截取當前視窗。請檢查權限或日誌。", is_error=True)
-
-    @Slot(dict)
-    def handle_region_capture(self, monitor_dict):
-        # This is triggered when the snipping tool finishes
-        # Restore window visibility immediately
-        self.restore_window_state()
-            
-        # Small delay (50ms) to ensure the overlay is fully closed before capture
-        QTimer.singleShot(50, lambda: self.finish_region_capture(monitor_dict))
-
-    def finish_region_capture(self, monitor_dict):
-        image_data = capture_region(monitor_dict)
-        if image_data is not None:
-            self.process_and_save(image_data)
-        else:
-            self.update_status("錯誤：無法截取指定範圍。請檢查權限或日誌。", is_error=True)
-
-    # --- Image Processing (QThreadPool) ---
-
-    def process_and_save(self, image_input: np.ndarray | QImage):
-        """Starts the background worker for image processing."""
-        self.update_status("正在背景處理並儲存影像...")
-        # image_input can be NumPy array (from screenshot) or QImage (from editor)
-        worker = ImageSaveWorker(image_input)
-        worker.signals.finished.connect(self.on_image_saved)
-        worker.signals.error.connect(self.on_image_error)
-        # Start the worker in the background thread pool
-        self.threadpool.start(worker)
-
-    @Slot(str)
-    def on_image_saved(self, path):
-        self.queue_model.add_item(path)
-        self.update_status(f"已加入待上傳區: {os.path.basename(path)}")
-
-    @Slot(str)
-    def on_image_error(self, error_message):
-        self.update_status(f"影像儲存失敗: {error_message}", is_error=True)
-
-    # --- Image Editor ---
-    
-    def open_editor(self, image_data: np.ndarray):
-        # Ensure any previous editor instance is closed
-        if self.editor_window and self.editor_window.isVisible():
-            if not self.editor_window.close():
-                # If user cancels closing (e.g., unsaved changes), stop opening a new one
+    def _start_snipping_tool(self):
+        st = self.snipping_tool
+        for name in ("start", "begin", "activate", "show"):
+            if hasattr(st, name) and callable(getattr(st, name)):
+                getattr(st, name)()
                 return
+        def _done(region_dict):
+            self._finish_region_capture(region_dict)
+        ov = _OverlaySnip(_done)
+        ov.show()
 
-        # Create and show the new editor window
-        self.editor_window = ImageEditorWindow(image_data, self)
-        self.editor_window.image_saved.connect(self.on_editor_saved)
+    def _do_capture(self, mode: str):
+        try:
+            img = capture_active_window()
+            self._restore_window()
+            if img is None or (isinstance(img, QPixmap) and img.isNull()):
+                raise RuntimeError("無法截取當前視窗。")
+            if mode == "edit":
+                self._open_editor(img)
+            else:
+                self._process_and_save(img)
+        except Exception as e:
+            logger.exception("截圖失敗：%s", e)
+            QMessageBox.critical(self, "截圖失敗", str(e))
+
+    def _handle_region_capture(self, monitor_dict: dict):
+        self._restore_window()
+        QTimer.singleShot(50, lambda: self._finish_region_capture(monitor_dict))
+
+    def _finish_region_capture(self, monitor_dict: dict):
+        img = capture_region(monitor_dict)
+        if img is None or (isinstance(img, QPixmap) and img.isNull()):
+            self._status("錯誤：無法截取指定範圍。", True)
+            return
+        self._process_and_save(img)
+
+    # ---------- 儲存與加入佇列 ----------
+    def _nd_to_qimage(self, arr: np.ndarray) -> QImage:
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        h, w = arr.shape[:2]
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            return QImage(arr.data, w, h, 3*w, QImage.Format_RGB888).copy()
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            return QImage(arr.data, w, h, 4*w, QImage.Format_RGBA8888).copy()
+        raise ValueError(f"Unsupported ndarray shape: {arr.shape}")
+
+    def _process_and_save(self, image_input):
+        try:
+            img_obj = image_input
+            if isinstance(image_input, np.ndarray):
+                img_obj = self._nd_to_qimage(image_input)
+
+            base_dir = settings_manager.get("Capture/Directory") or str(Path.home() / "Pictures" / "FastDaytradeAssistant")
+            opts = ImageSaveOptions(base_dir=base_dir, preferred_ext="webp", use_date_subdir=True, prefix="")
+
+            def on_started(): self._status("正在背景處理並儲存影像...")
+            def on_done(path: str, ms: float):
+                logger.info("Image saved in %.2f ms: %s", ms, path)
+                self._on_image_saved(path)
+            def on_error(msg: str):
+                logger.error("存檔失敗: %s", msg)
+                QMessageBox.critical(self, "存檔失敗", msg)
+
+            save_image_async(img_obj, opts, on_started=on_started, on_done=on_done, on_error=on_error)
+        except Exception as e:
+            logger.exception("process/save 例外：%s", e)
+            QMessageBox.critical(self, "錯誤", str(e))
+
+    def _on_image_saved(self, path: str):
+        self.queue_model.add_item(path)
+        try:
+            sel = self.queue_view.selectionModel()
+            if sel:
+                sel.clearSelection()
+                idx = self.queue_model.index(0, 0)
+                self.queue_view.setCurrentIndex(idx)
+                sel.select(idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+                self.queue_view.scrollTo(idx)
+        except Exception:
+            pass
+        self._status(f"已加入待上傳區: {os.path.basename(path)}")
+        # 嘗試從檔名自動帶出代號/名稱（若尚未填）
+        if not self.ed_symbol.text().strip() or not self.ed_name.text().strip():
+            self._auto_fill_symbol_name([path])
+
+    # ---------- 編輯器 ----------
+    def _open_editor(self, image):
+        from ui.editor.editor_window import ImageEditorWindow
+        if hasattr(self, "editor_window") and self.editor_window and self.editor_window.isVisible():
+            if not self.editor_window.close():
+                return
+        self.editor_window = ImageEditorWindow(image, self)
+        self.editor_window.image_saved.connect(lambda qimg: self._process_and_save(qimg))
         self.editor_window.show()
 
-    @Slot(QImage)
-    def on_editor_saved(self, edited_qimage: QImage):
-        # Process the QImage returned from the editor (save it)
-        self.process_and_save(edited_qimage)
-
-    # --- AI Analysis (Asyncio) ---
-
+    # ---------- 分析 ----------
     def send_analysis_request(self):
-        # Re-check API key before sending
-        if not self.update_send_button_state():
-            QMessageBox.warning(self, "API Key 未設定", self.send_button.toolTip())
+        if not self._update_send_ready():
+            QMessageBox.warning(self, "API Key 未設定", self.send_button.toolTip() or "請先至「設定」配置 API Key")
             return
 
-        selected_indexes = self.queue_view.selectionModel().selectedIndexes()
-        
-        # If nothing is selected, show warning
-        if not selected_indexes:
-            if self.queue_model.rowCount() == 0:
-                self.update_status("請先截圖再進行分析。", is_error=True)
-            else:
-                QMessageBox.information(self, "提示", "請在左側待上傳區選擇要分析的圖片（可多選）。")
-            return
+        sel = self.queue_view.selectionModel()
+        idxs = sel.selectedIndexes() if sel else []
+        if not idxs and self.queue_model.rowCount() > 0:
+            idxs = [self.queue_model.index(0, 0)]
+            if sel:
+                sel.setCurrentIndex(idxs[0], QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
 
-        # Get paths in the correct visual order (handled by the model)
-        image_paths = self.queue_model.get_paths_by_indexes(selected_indexes)
+        if not idxs:
+            self._status("請先截圖再分析。", True); return
+
+        image_paths = self.queue_model.get_paths_by_indexes(idxs)
+
+        # 構造 meta：股票代號/名稱
+        symbol = self.ed_symbol.text().strip() or ""
+        name = self.ed_name.text().strip() or ""
+        if not symbol or not name:
+            guess_sym, guess_name = self._guess_symbol_name_from_paths(image_paths)
+            if not symbol:
+                symbol = guess_sym or ""
+            if not name:
+                name = guess_name or ""
+            # 若猜到就回填 UI
+            if symbol and not self.ed_symbol.text().strip():
+                self.ed_symbol.setText(symbol)
+            if name and not self.ed_name.text().strip():
+                self.ed_name.setText(name)
+
+        meta_line = ""
+        if symbol or name:
+            meta_line = f"【股票】代號={symbol or 'null'}; 名稱={name or 'null'}\n"
+
         user_text = self.user_input.toPlainText().strip()
+        mode_idx = self.cb_mode.currentIndex()
+        if mode_idx == 1:
+            hint = ("【分析模式】當沖：請同時產出 long/short 兩套方案；提供 entry/stop/targets 與 plan；"
+                    "並給出 bias（多/空/觀望）。若 bias 為多或空，將該方向的 entry/stop 映射到頂層。")
+            user_text = (user_text + "\n\n" + hint) if user_text else hint
+        elif mode_idx == 2:
+            hint = ("【分析模式】短波投資：聚焦日K與30~60分K，提供 bias 與分批目標；"
+                    "說明隔日～數日持倉條件與移動停損邏輯。若 bias 為多或空，映射到頂層 entry/stop。")
+            user_text = (user_text + "\n\n" + hint) if user_text else hint
 
-        # Start the async task using the qasync event loop integration
-        # We pass a copy (list(...)) to ensure indexes remain valid during async operation
-        asyncio.create_task(self.run_analysis(image_paths, user_text, list(selected_indexes)))
+        # 把 meta 放在最前面，讓模型權威採用
+        payload_text = (meta_line + user_text) if meta_line else user_text
 
-    async def run_analysis(self, image_paths: list[str], user_text: str, uploaded_indexes: list):
         self.set_loading_state(True)
-        # Use the ai_manager to determine the active provider for status update
-        provider = ai_manager.active_provider
-        self.update_status(f"開始分析請求 (使用 {provider})...")
+        prov = settings_manager.get("AI/Provider") or "OpenAI"
+        self._status(f"開始分析請求 (使用 {prov})...")
+        asyncio.create_task(self._run_analysis(image_paths, payload_text))
+
+    async def _run_analysis(self, image_paths: list[str], user_text: str):
         try:
-            # Await the async analysis using the ai_manager
-            result = await ai_manager.analyze(image_paths, user_text)
-            self.on_analysis_finished(result, uploaded_indexes)
+            result: AnalysisResult = await ai_manager.analyze(image_paths, user_text)
+            self._status(f"分析完成。耗時: {result.response_time:.2f}s")
+            card = AnalysisCard(result)
+            self.results_layout.insertWidget(0, card)
+            if settings_manager.get("General/AutoClearQueue"):
+                sel = self.queue_view.selectionModel()
+                idxs = sel.selectedIndexes() if sel else []
+                self.queue_model.remove_items(idxs)
+                self.user_input.clear()
         except Exception as e:
-            self.on_analysis_error(str(e))
+            self._status(f"分析失敗: {e}", True)
+            QMessageBox.critical(self, "分析錯誤", f"請求 AI 分析時發生錯誤：\n\n{e}")
         finally:
             self.set_loading_state(False)
 
-    def on_analysis_finished(self, result: AnalysisResult, uploaded_indexes: list):
-        self.update_status(f"分析完成。耗時: {result.response_time:.2f}s")
-        
-        # Display result by creating a card widget
-        card = AnalysisCard(result)
-        # Insert the new card at the top of the results layout
-        self.results_layout.insertWidget(0, card)
-
-        # Auto clear queue if configured in settings
-        if settings_manager.get("General/AutoClearQueue"):
-            # Clear the items that were successfully uploaded
-            self.queue_model.remove_items(uploaded_indexes)
-            self.user_input.clear() # Clear the input text box
-
-    def on_analysis_error(self, error_message: str):
-        self.update_status(f"分析失敗: {error_message}", is_error=True)
-        QMessageBox.critical(self, "分析錯誤", f"請求 AI 分析時發生錯誤：\n\n{error_message}")
-
-    # --- Utilities ---
-
-    def update_status(self, message, is_error=False):
-        # Show message in status bar for 5 seconds
-        self.statusBar.showMessage(message, 5000)
-        if is_error:
-            logger.error(message)
-        else:
-            logger.info(message)
-
-    def set_loading_state(self, is_loading):
-        if is_loading:
-            self.send_button.setEnabled(False)
-            self.send_button.setText("分析中...")
-        else:
-            # When finished loading, double check API key validity before re-enabling
-            self.update_send_button_state()
-            self.send_button.setText("送出分析請求")
-
+    # ---------- 設定視窗 ----------
     def open_settings(self):
-        dialog = SettingsDialog(self)
-        dialog.exec()
-        # SettingsManager emits settings_changed signal automatically upon saving
+        try:
+            dlg = SettingsDialog(self)
+            dlg.exec()
+        except Exception as e:
+            QMessageBox.critical(self, "設定", f"無法開啟設定視窗：{e}")
+
+    # ---------- 雜項 ----------
+    def _queue_menu(self, pos):
+        indexes = self.queue_view.selectedIndexes()
+        menu = QMenu(self)
+        if indexes:
+            act_del = QAction("刪除選取", self); act_del.triggered.connect(lambda: self.queue_model.remove_items(list(indexes))); menu.addAction(act_del)
+        if menu.actions():
+            menu.exec(self.queue_view.viewport().mapToGlobal(pos))
+
+    def _on_mode_changed(self, idx: int):
+        value = {0: "Auto", 1: "DayTrade", 2: "ShortSwing"}.get(idx, "Auto")
+        settings_manager.set("AI/AnalysisMode", value); settings_manager.save_and_emit()
 
     def on_settings_changed(self):
-        """Callback when settings are updated."""
-        self.update_hotkey_display()
-        # Only update button state if not currently loading
-        if self.send_button.text() != "分析中...":
-            self.update_send_button_state()
-        # HotkeyManager and AIManager listen to this signal and reload automatically
+        self._update_send_ready()
 
-    def update_send_button_state(self) -> bool:
-        """Updates the send button based on the active provider's API key. Returns True if ready."""
-        # Check the API key for the CURRENTLY ACTIVE provider
-        active_provider = settings_manager.get("AI/Provider")
-        
-        is_ready = False
+    def _update_send_ready(self) -> bool:
+        prov = settings_manager.get("AI/Provider") or "OpenAI"
         try:
-            api_key = settings_manager.get_api_key(active_provider)
-            if not api_key:
-                self.send_button.setEnabled(False)
-                self.send_button.setToolTip(f"請先至「設定」配置 {active_provider} API Key")
-            else:
-                is_ready = True
-                # Only enable if not currently loading
-                if self.send_button.text() != "分析中...":
-                    self.send_button.setEnabled(True)
-                self.send_button.setToolTip("")
-        except ValueError:
-             # Handle case where provider name might be invalid
-             self.send_button.setEnabled(False)
-             self.send_button.setToolTip(f"無效的 AI 供應商: {active_provider}")
-        
-        return is_ready
+            api_key = settings_manager.get_api_key(prov)
+            ready = bool(api_key)
+            self.send_button.setToolTip("" if ready else f"請先至「設定」配置 {prov} API Key")
+            return ready
+        except Exception:
+            self.send_button.setToolTip(f"無效的 AI 供應商: {prov}")
+            return False
 
+    def set_loading_state(self, loading: bool):
+        self.send_button.setEnabled(not loading)
+        self.send_button.setText("分析中..." if loading else "送出分析請求")
 
-    def update_hotkey_display(self):
-        """Updates the toolbar button text with current hotkeys."""
-        hk = settings_manager.get_hotkeys()
+    def _status(self, msg: str, err: bool = False):
+        self.statusBar.showMessage(msg, 5000)
+        (logger.error if err else logger.info)(msg)
 
-        self.action_f2.setText(f"截當前視窗 ({hk['F2'] or 'N/A'})")
-        self.action_f3.setText(f"截並編輯 ({hk['F3'] or 'N/A'})")
-        self.action_f4.setText(f"框選截圖 ({hk['F4'] or 'N/A'})")
-
-        # Also set app-level shortcuts as fallback if global hotkeys fail
+    def closeEvent(self, e):
         try:
-            self.action_f2.setShortcut(QKeySequence(hk['F2']))
-            self.action_f3.setShortcut(QKeySequence(hk['F3']))
-            self.action_f4.setShortcut(QKeySequence(hk['F4']))
-        except Exception as e:
-            logger.warning(f"Failed to set fallback application shortcuts: {e}")
+            self.hotkey_manager.stop()
+        except Exception:
+            pass
+        super().closeEvent(e)
 
-    def show_queue_context_menu(self, position):
-        indexes = self.queue_view.selectedIndexes()
-        menu = QMenu()
+    # ---------- 代號/名稱猜測 ----------
+    def _auto_fill_symbol_name(self, paths: list[str]):
+        sym, name = self._guess_symbol_name_from_paths(paths)
+        if sym and not self.ed_symbol.text().strip():
+            self.ed_symbol.setText(sym)
+        if name and not self.ed_name.text().strip():
+            self.ed_name.setText(name)
 
-        if indexes:
-            action_delete = QAction("刪除選取項目", self)
-            # Pass a copy of the list to ensure indexes remain valid if model changes
-            action_delete.triggered.connect(lambda: self.queue_model.remove_items(list(indexes)))
-            menu.addAction(action_delete)
-
-            # Actions for single selection
-            if len(indexes) == 1:
-                path_role = Qt.ItemDataRole.UserRole + 1 # Corresponds to PathRole in UploadQueueModel
-                path = self.queue_model.data(indexes[0], path_role)
-                
-                if path and os.path.exists(path):
-                    action_open = QAction("開啟檔案", self)
-                    action_open.triggered.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
-                    menu.addAction(action_open)
-                    
-                    action_open_folder = QAction("開啟資料夾位置", self)
-                    # Open the directory containing the file
-                    action_open_folder.triggered.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path))))
-                    menu.addAction(action_open_folder)
-
-        # Execute the menu at the global position mapped from the viewport
-        if menu.actions():
-            menu.exec(self.queue_view.viewport().mapToGlobal(position))
-
-    def load_styles(self):
-        try:
-            # Determine the base directory for finding assets robustly
-            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-                # Bundled application (e.g., PyInstaller)
-                base_dir = sys._MEIPASS
-            else:
-                # Running from source
-                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-            style_path = os.path.join(base_dir, 'assets', 'styles.qss')
-            
-            if os.path.exists(style_path):
-                with open(style_path, "r", encoding="utf-8") as f:
-                    self.setStyleSheet(f.read())
-            else:
-                 logger.warning(f"styles.qss not found at {style_path}. Using default style.")
-        except Exception as e:
-            logger.warning(f"Error loading styles.qss: {e}")
-
-    def closeEvent(self, event):
-        # Ensure graceful shutdown
-        logger.info("Shutting down application...")
-        
-        # Ensure the editor window is closed properly
-        if self.editor_window and self.editor_window.isVisible():
-            if not self.editor_window.close():
-                # If the user cancels closing the editor, cancel closing the main app
-                event.ignore()
-                return
-
-        self.hotkey_manager.stop()
-        # Wait briefly (1 second) for running background tasks (like image saving) to finish
-        if not self.threadpool.waitForDone(1000):
-            logger.warning("Background tasks did not finish in time during shutdown.")
-        event.accept()
+    def _guess_symbol_name_from_paths(self, paths: list[str]) -> tuple[str | None, str | None]:
+        """
+        依常見檔名規則猜測：
+        - 4 碼台股代號：r'\\b(\\d{4})\\b'
+        - 名稱：去除代號與常見分隔後的中文字/英文片段
+        """
+        sym = None
+        name = None
+        for p in paths:
+            fname = os.path.basename(p)
+            base, _ = os.path.splitext(fname)
+            # 取第一個 4 碼數字
+            m = re.search(r'(?<!\d)(\d{4})(?!\d)', base)
+            if m and not sym:
+                sym = m.group(1)
+            # 嘗試把代號與數字、時間戳移除，保留中英文
+            tmp = re.sub(r'[\d_\\-]+', ' ', base)  # 移除數字/底線/連字號
+            tmp = re.sub(r'\s+', ' ', tmp).strip()
+            # 常見 pattern：台積電、TSMC、MediaTek、長榮 等
+            m2 = re.search(r'([A-Za-z]{2,}|[\u4e00-\u9fa5]{2,})', tmp)
+            if m2 and not name:
+                name = m2.group(1)
+            if sym and name:
+                break
+        return sym, name

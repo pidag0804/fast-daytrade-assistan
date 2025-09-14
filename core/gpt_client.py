@@ -1,190 +1,162 @@
-import base64
-import time
-import json
+# core/gpt_client.py
+from __future__ import annotations
+import os
 import logging
-import mimetypes
-from typing import List, Dict, Any, Tuple
-# Use AsyncOpenAI for non-blocking network I/O
-from openai import AsyncOpenAI, OpenAIError, APITimeoutError
-from pydantic import ValidationError
-from core.config import settings_manager
-from core.models import AnalysisResult
+from dataclasses import dataclass
+from typing import List, Tuple
 
-logger = logging.getLogger(__name__)
+from .prompts import SYSTEM_PROMPT  # 若你的路徑不同，請調整
+from utils.image_utils import file_to_png_data_uri
 
-# --- System Prompt ---
-SYSTEM_PROMPT = """
-你是一位嚴謹的台股當沖分析助手。你會根據使用者提供的「當下分K走勢截圖、成交量、委買委賣/五檔（若有）、均線/MACD/KD 等提示（若能看見）」來判斷：
-1) 今日此標的適合做「多 / 空 / 觀望」何者。
-2) 建議入場價位（明確數字）。
-3) 明確停損價位（明確數字，並簡述邏輯）。
-4) 是否適合留倉做短波（是/否，必要時列出條件，如量能、均線排列、關鍵價位）。
+# .env 支援（可省略）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-請務必：
-- 優先參考影像中的最近 30~60 分鐘變化與關鍵價。
-- 簡明扼要，避免贅述；所有關鍵價位皆需有依據（前高/前低、均線、缺口、趨勢線、VWAP 等）。
-- 產出 **嚴格 JSON**（UTF-8，不要有多餘文字），符合下述 schema。
-- 若影像無法判讀數據，請以 `"confidence": 0.0` 回報並於 `"notes"` 說明需要的補充資訊。
+log = logging.getLogger(__name__)
 
-JSON Schema:
-{
-  "bias": "多" | "空" | "觀望",
-  "entry_price": number | null,
-  "stop_loss": number | null,
-  "hold_overnight": true | false | null,
-  "rationale": string,          
-  "risk_score": 1 | 2 | 3 | 4 | 5,  
-  "confidence": number,          
-  "notes": string                
-}
-"""
+@dataclass
+class SpeedConfig:
+    mode: str                 # "Auto" / "Fast" / "Balanced" / "Deep"
+    models: dict              # {"Fast": "...", "Balanced": "...", "Deep": "..."}
 
-# --- GPT Client Logic ---
 class GPTClient:
-    """Handles OpenAI API interactions using AsyncOpenAI."""
-    def __init__(self):
-        self.client = None
-        self.api_key = None
-        self.load_settings()
-        settings_manager.settings_changed.connect(self.load_settings)
-
-    def initialize_client(self):
-        api_key = settings_manager.get_api_key()
+    """
+    對 OpenAI / 相容 API 的薄封裝：
+    - GPT-5: Chat Completions → 使用 max_completion_tokens
+             Responses       → 使用 max_output_tokens
+    - 其他舊模型：優先 max_tokens（若被拒，再自動切換）
+    - 自動處理多張圖（image_url / input_image），並回傳 (model, text)
+    """
+    def __init__(self, speed_cfg: SpeedConfig, timeout: float = 40.0):
+        self.speed_cfg = speed_cfg
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not api_key:
-            self.client = None
-            self.api_key = None
-            return False
-        
-        if api_key != self.api_key:
-            try:
-                # Initialize AsyncOpenAI client
-                self.client = AsyncOpenAI(api_key=api_key, timeout=self.timeout + 2)
-                self.api_key = api_key
-                return True
-            except Exception as e:
-                logger.error(f"Failed to initialize OpenAI client: {e}")
-                self.client = None
-                self.api_key = None
-                return False
-        return bool(self.client)
+            raise RuntimeError("缺少 OPENAI_API_KEY，請於環境變數或 .env 設定。")
 
-    def load_settings(self):
-        self.model_fast = settings_manager.get("OpenAI/ModelFast")
-        self.model_deep = settings_manager.get("OpenAI/ModelDeep")
-        self.strategy = settings_manager.get("OpenAI/Strategy")
-        self.timeout = settings_manager.get("OpenAI/Timeout")
-        self.max_images = settings_manager.get("OpenAI/MaxImages")
-        # Re-initialize if key changed or client doesn't exist
-        self.initialize_client()
-        if self.client:
-            self.client.timeout = self.timeout + 2
+        # OpenAI SDK ≥ 1.x
+        from openai import OpenAI
+        # 可在此調 base_url = os.getenv("OPENAI_BASE_URL", None)
+        self.client = OpenAI(api_key=api_key, timeout=timeout)
 
-    def determine_model(self, image_count: int, user_text: str) -> str:
-        """Auto Speed Strategy implementation."""
-        if self.strategy == "Fast":
-            return self.model_fast
-        if self.strategy == "Deep":
-            return self.model_deep
+    # ---------- public ----------
+    def analyze(self, image_paths: List[str]) -> Tuple[str, str]:
+        if not image_paths:
+            raise ValueError("未提供任何圖片。")
 
-        # Auto Strategy
-        # Rule 1: Many images (>3) or short timeout (<4s) -> Fast
-        if image_count > 3 or self.timeout < 4:
-            return self.model_fast
-        
-        # Rule 2: Single image + text -> Deep
-        if image_count == 1 and user_text.strip():
-            return self.model_deep
-            
-        # Default Auto: Deep (Standard)
-        return self.model_deep
+        model = self._select_model(image_paths)
+        log.info("Starting analysis. Strategy: %s. Selected Model: %s", self.speed_cfg.mode, model)
 
-    async def analyze(self, image_paths: List[str], user_text: str) -> AnalysisResult:
-        if not self.client:
-            if not self.initialize_client():
-                raise RuntimeError("OpenAI Client not initialized (check API key).")
+        # 先嘗試 Chat Completions（支援 vision）
+        try:
+            text = self._chat_completions(model, image_paths)
+            return model, text
+        except Exception as e1:
+            log.warning("Chat Completions 失敗，嘗試 Responses API。原因：%s", e1)
 
-        # Settings might have changed since last run, ensure they are up-to-date for this request
-        self.load_settings() 
-        
-        model = self.determine_model(len(image_paths), user_text)
-        logger.info(f"Starting analysis. Strategy: {self.strategy}. Selected Model: {model}")
+        # 再嘗試 Responses API（multimodal）
+        text = self._responses_api(model, image_paths)
+        return model, text
+
+    # ---------- internal ----------
+    def _select_model(self, image_paths: List[str]) -> str:
+        # 你若已有 Auto 規則，可保留；這裡簡化以 Deep 為 GPT-5、Fast 為更省的模型
+        mode = (self.speed_cfg.mode or "Auto").strip()
+        m = self.speed_cfg.models or {}
+        if mode == "Fast":
+            return m.get("Fast") or "gpt-4o-mini"
+        elif mode == "Balanced":
+            return m.get("Balanced") or "gpt-4o"
+        elif mode == "Deep":
+            return m.get("Deep") or "gpt-5"
+        else:
+            # Auto：簡化若圖多就 Deep，否則 Balanced
+            if len(image_paths) >= 3:
+                return m.get("Deep") or "gpt-5"
+            return m.get("Balanced") or "gpt-4o"
+
+    def _build_chat_messages(self, image_paths: List[str]) -> list:
+        # Chat Completions 用法：type=image_url
+        content = [{"type": "text", "text": "以下是多張技術圖（含日K與5分K）。請依系統提示輸出五段落結論。"}]
+        for p in image_paths:
+            data_uri = file_to_png_data_uri(p)  # 無論原始格式，統一轉 png data URI
+            content.append({"type": "image_url", "image_url": {"url": data_uri}})
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ]
+
+    def _build_responses_input(self, image_paths: List[str]) -> list:
+        # Responses API 用法：type=input_image
+        parts = [{"type": "text", "text": "以下是多張技術圖（含日K與5分K）。請依系統提示輸出五段落結論。"}]
+        for p in image_paths:
+            data_uri = file_to_png_data_uri(p)
+            parts.append({"type": "input_image", "image_url": {"url": data_uri}})
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": parts},
+        ]
+
+    def _chat_completions(self, model: str, image_paths: List[str]) -> str:
+        msgs = self._build_chat_messages(image_paths)
+        prefer_new_name = model.startswith("gpt-5")
+        # 先用新的參數名（GPT-5）
+        kwargs = dict(model=model, messages=msgs, temperature=0.2)
+        if prefer_new_name:
+            kwargs["max_completion_tokens"] = 700
+        else:
+            kwargs["max_tokens"] = 700
 
         try:
-            # Await the async API call
-            return await self._attempt_analysis(model, image_paths, user_text)
-        
-        except APITimeoutError as e:
-            # Timeout Fallback: If not already fast, retry with fast model
-            if model != self.model_fast:
-                logger.warning(f"Timeout occurred with {model}. Retrying with Fast Model.")
-                return await self._attempt_analysis(self.model_fast, image_paths, user_text)
+            resp = self.client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content
+        except Exception as e:
+            s = str(e)
+            # 若伺服器回 unsupported_parameter，改用另一個名稱重試一次
+            if "unsupported_parameter" in s or "max_tokens" in s or "max_completion_tokens" in s:
+                if "max_tokens" in kwargs:
+                    kwargs.pop("max_tokens", None)
+                    kwargs["max_completion_tokens"] = 700
+                else:
+                    kwargs.pop("max_completion_tokens", None)
+                    kwargs["max_tokens"] = 700
+                resp = self.client.chat.completions.create(**kwargs)
+                return resp.choices[0].message.content
+            raise
+
+    def _responses_api(self, model: str, image_paths: List[str]) -> str:
+        inp = self._build_responses_input(image_paths)
+        try:
+            resp = self.client.responses.create(
+                model=model,
+                input=inp,
+                max_output_tokens=700,     # Responses 的參數名
+            )
+        except Exception as e:
+            # 某些代理/相容服務用 "max_tokens"；自動退回一次
+            s = str(e)
+            if "max_output_tokens" in s and "unsupported" in s.lower():
+                resp = self.client.responses.create(
+                    model=model,
+                    input=inp,
+                    max_tokens=700,
+                )
             else:
-                raise RuntimeError(f"API 請求超時 (使用快速模型依然失敗)。請檢查網路或增加等待時間。")
-        except (OpenAIError, ValidationError, ValueError) as e:
-             raise RuntimeError(f"分析失敗: {e}")
-
-    async def _attempt_analysis(self, model: str, image_paths: List[str], user_text: str) -> AnalysisResult:
-        start_time = time.time()
-        payload = self._prepare_payload(image_paths, user_text, model)
-        
-        # Await the async API call
-        response = await self.client.chat.completions.create(**payload)
-        
-        end_time = time.time()
-        response_time = end_time - start_time
-        logger.info(f"API call completed in {response_time:.2f} seconds. Model: {model}")
-        
-        result = self._parse_response(response)
-        result.model_used = model
-        result.response_time = response_time
-        return result
-
-    def _prepare_payload(self, image_paths: List[str], user_text: str, model: str) -> Dict[str, Any]:
-        content = []
-        if user_text:
-            content.append({"type": "text", "text": user_text})
-
-        for path in image_paths[:self.max_images]:
-            try:
-                encoded_string, mime_type = self._encode_image(path)
-                
-                content.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime_type};base64,{encoded_string}",
-                        "detail": "high" # High detail for charts
-                    }
-                })
-            except IOError as e:
-                logger.error(f"Error reading image file {path}: {e}")
                 raise
-        
-        return {
-            "model": model,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": content}
-            ],
-            "max_tokens": 1000,
-            "temperature": 0.2 # Low temperature for analytical tasks
-        }
 
-    def _encode_image(self, path: str) -> Tuple[str, str]:
-        mime_type = mimetypes.guess_type(path)[0] or 'image/webp'
-        with open(path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8'), mime_type
-
-    def _parse_response(self, response) -> AnalysisResult:
-        try:
-            content = response.choices[0].message.content
-            if not content:
-                raise ValueError("API returned an empty response.")
-            # Pydantic v2+ can validate JSON strings directly
-            return AnalysisResult.model_validate_json(content)
-        except ValidationError as e:
-            # Catch JSON decode errors and validation errors
-            raise ValueError(f"API response parsing/validation failed: {e}. Response: {content[:200] if content else 'Empty'}...")
-
-# Global instance
-gpt_client = GPTClient()
+        # 取文字（兼容不同 SDK 版本）
+        text = getattr(resp, "output_text", "") or ""
+        if text:
+            return text
+        out = getattr(resp, "output", None)
+        if out:
+            chunks = []
+            for it in out:
+                if getattr(it, "type", "") == "output_text":
+                    chunks.append(it.text)
+            if chunks:
+                return "".join(chunks)
+        # 最後保底
+        return str(resp)

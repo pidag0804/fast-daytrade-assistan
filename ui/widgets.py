@@ -1,61 +1,46 @@
-from PySide6.QtWidgets import (
-    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout
+# ui/widgets.py
+from PySide6.QtWidgets import QWidget, QFrame, QLabel, QGridLayout
+from PySide6.QtGui import QPainter, QPen, QColor, QGuiApplication
+from PySide6.QtCore import Qt, QRect, Signal
+from core.models import (
+    AnalysisResult, TradePlan, PlanBreakdown, OperationCycle,
 )
-from PySide6.QtCore import Qt, QPoint, QRect, Signal
-from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication
-from core.models import AnalysisResult
 
-# --- F4 Snipping Tool ---
+# ----------- 擷取工具 -----------
 
 class SnippingTool(QWidget):
-    """A full-screen overlay for region selection (F4)."""
-    # Emits monitor_dict {'left', 'top', 'width', 'height'}
-    snipping_finished = Signal(dict) 
+    snipping_finished = Signal(dict)
 
     def __init__(self):
         super().__init__()
         self.setWindowFlags(
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.Tool
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
         )
+        self.setWindowState(Qt.WindowState.WindowFullScreen)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setCursor(Qt.CursorShape.CrossCursor)
-
-        self.begin = QPoint()
-        self.end = QPoint()
+        self.begin = None
+        self.end = None
         self.is_snipping = False
-        self.mask_color = QColor(0, 0, 0, 100)
-
-    def start(self):
-        # Cover the entire virtual desktop across all monitors
-        screen_rect = QGuiApplication.primaryScreen().virtualGeometry()
-        self.setGeometry(screen_rect)
-        self.showFullScreen()
-        self.activateWindow()
-        self.raise_()
 
     def paintEvent(self, event):
+        if not self.isVisible():
+            return
         painter = QPainter(self)
-        painter.fillRect(self.rect(), self.mask_color)
-
-        if self.is_snipping:
-            rect = QRect(self.begin, self.end).normalized()
-            
-            # Clear the selected area
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRect(self.begin or self.rect().center(), self.end or self.rect().center()).normalized()
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 80))
+        if rect.width() > 0 and rect.height() > 0:
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
             painter.fillRect(rect, Qt.GlobalColor.transparent)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-
-            # Draw border
-            pen = QPen(QColor(0, 120, 215), 2) # Blue border
-            painter.setPen(pen)
+            painter.setPen(QPen(QColor(0, 120, 215), 2))
             painter.drawRect(rect)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            # Use position relative to the widget (which covers the virtual desktop)
-            self.begin = event.pos() 
+            self.begin = event.pos()
             self.end = self.begin
             self.is_snipping = True
             self.update()
@@ -71,30 +56,20 @@ class SnippingTool(QWidget):
         if event.button() == Qt.MouseButton.LeftButton and self.is_snipping:
             self.is_snipping = False
             rect = QRect(self.begin, self.end).normalized()
-            
             if rect.width() > 10 and rect.height() > 10:
-                # Get the virtual desktop origin to calculate absolute screen coordinates
                 virtual_origin = QGuiApplication.primaryScreen().virtualGeometry().topLeft()
-                
-                monitor_dict = {
-                    'left': virtual_origin.x() + rect.left(),
-                    'top': virtual_origin.y() + rect.top(),
-                    'width': rect.width(),
-                    'height': rect.height()
-                }
-                self.hide() # Hide immediately before capture
+                monitor_dict = {'left': virtual_origin.x() + rect.left(),'top': virtual_origin.y() + rect.top(),'width': rect.width(),'height': rect.height()}
+                self.hide()
                 self.snipping_finished.emit(monitor_dict)
-            
             self.close()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
             self.close()
 
-# --- Analysis Result Card ---
+# ----------- 結果卡片 -----------
 
 class AnalysisCard(QFrame):
-    """Displays the GPT analysis result in a structured card format."""
     def __init__(self, result: AnalysisResult, parent=None):
         super().__init__(parent)
         self.setObjectName("ResultCard")
@@ -104,28 +79,23 @@ class AnalysisCard(QFrame):
     def setup_ui(self, result: AnalysisResult):
         layout = QGridLayout(self)
 
-        # Title/Header
         title = QLabel(f"交易建議 (信心: {result.confidence*100:.0f}%, 風險: {result.risk_score}/5)")
         title.setObjectName("CardTitle")
         layout.addWidget(title, 0, 0, 1, 4)
 
-        # Key Information
-        bias_label = QLabel("方向:")
+        bias_label = QLabel("建議方向:")
         bias_value = QLabel(result.bias)
-        # Apply specific property for QSS styling based on bias
-        bias_value.setProperty("bias", result.bias) 
         bias_value.setObjectName("CardBias")
-
         layout.addWidget(bias_label, 1, 0)
         layout.addWidget(bias_value, 1, 1)
 
         entry_label = QLabel("建議入場:")
-        entry_value = QLabel(f"{result.entry_price:.2f}" if result.entry_price else "N/A")
+        entry_value = QLabel(f"{result.entry_price:.2f}" if result.entry_price is not None else "N/A")
         layout.addWidget(entry_label, 2, 0)
         layout.addWidget(entry_value, 2, 1)
 
-        sl_label = QLabel("停損價位:")
-        sl_value = QLabel(f"{result.stop_loss:.2f}" if result.stop_loss else "N/A")
+        sl_label = QLabel("建議停損:")
+        sl_value = QLabel(f"{result.stop_loss:.2f}" if result.stop_loss is not None else "N/A")
         layout.addWidget(sl_label, 3, 0)
         layout.addWidget(sl_value, 3, 1)
 
@@ -135,27 +105,115 @@ class AnalysisCard(QFrame):
         layout.addWidget(hold_label, 1, 2)
         layout.addWidget(hold_value, 1, 3)
 
-        # Rationale
-        rationale_label = QLabel("分析理由:")
-        layout.addWidget(rationale_label, 4, 0, 1, 4)
-        rationale_text = QLabel(result.rationale)
-        rationale_text.setWordWrap(True)
-        layout.addWidget(rationale_text, 5, 0, 1, 4)
+        row = 4
 
-        # Notes (if any)
-        row_index = 6
+        def add_block(title_text: str, value_text: str):
+            nonlocal row
+            lbl = QLabel(title_text)
+            val = QLabel(value_text or "—")
+            val.setWordWrap(True)
+            layout.addWidget(lbl, row, 0)
+            layout.addWidget(val, row, 1, 1, 3)
+            row += 1
+
+        add_block("結構：", result.structure)
+        add_block("動能：", result.momentum)
+        add_block("關鍵價位：", result.key_levels)
+        add_block("交易計畫（總結）：", result.trade_plan)
+        add_block("加分訊號：", result.bonus_signals)
+
+        # 交易計畫（條列）
+        if result.plan_breakdown:
+            lbl = QLabel("交易計畫（條列）：")
+            layout.addWidget(lbl, row, 0)
+            pb = result.plan_breakdown
+            lines = []
+            if pb.entry: lines.append(f"1) 進場：{pb.entry}")
+            if pb.stop: lines.append(f"2) 停損：{pb.stop}")
+            if pb.take_profit: lines.append(f"3) 停利：{pb.take_profit}")
+            val = QLabel("\n".join(lines) if lines else "—"); val.setWordWrap(True)
+            layout.addWidget(val, row, 1, 1, 3); row += 1
+
+        # 操作週期
+        if result.operation_cycle:
+            oc = result.operation_cycle
+            lbl = QLabel("操作週期：")
+            layout.addWidget(lbl, row, 0)
+            lines = []
+            if oc.momentum: lines.append(f"1) 動能：{oc.momentum}")
+            if oc.volume: lines.append(f"2) 成交量：{oc.volume}")
+            if oc.institutions: lines.append(f"3) 法人籌碼：{oc.institutions}")
+            if oc.concentration: lines.append(f"4) 籌碼集中度：{oc.concentration}")
+            val = QLabel("\n".join(lines) if lines else "—"); val.setWordWrap(True)
+            layout.addWidget(val, row, 1, 1, 3); row += 1
+
+        # 位階判斷
+        pos = getattr(result, "position", None)
+        if pos:
+            lbl = QLabel("位階判斷：")
+            layout.addWidget(lbl, row, 0)
+            parts = [f"{getattr(pos, 'level', '—')}"]
+            try:
+                def fmt_pct(x): return f"{x*100:.1f}%" if x is not None else "—"
+                parts.append(f"距52W高 {fmt_pct(pos.pct_from_52w_high)}")
+                parts.append(f"距52W低 {fmt_pct(pos.pct_from_52w_low)}")
+                parts.append(f"距MA200 {fmt_pct(pos.pct_from_ma200)}")
+                parts.append(f"距MA60 {fmt_pct(pos.pct_from_ma60)}")
+                parts.append(f"AVWAP距離 {fmt_pct(pos.avwap_from_pivot)}")
+            except Exception:
+                pass
+            val = QLabel("；".join(parts))
+            val.setWordWrap(True)
+            layout.addWidget(val, row, 1, 1, 3); row += 1
+
+        # 低位階買入評估 + 入場建議
+        if getattr(result, "buy_suitable", None) is not None or getattr(result, "entry_candidates", None):
+            lbl = QLabel("低位階買入評估：")
+            layout.addWidget(lbl, row, 0)
+            ok_txt = "適合" if result.buy_suitable else "不適合" if result.buy_suitable is False else "—"
+            reason = (result.buy_reason or "").strip()
+            text = ok_txt + (f"（{reason}）" if reason else "")
+            val = QLabel(text); val.setWordWrap(True)
+            layout.addWidget(val, row, 1, 1, 3); row += 1
+
+            cands = getattr(result, "entry_candidates", []) or []
+            if cands:
+                lbl2 = QLabel("入場建議：")
+                layout.addWidget(lbl2, row, 0)
+                lines = []
+                for i, c in enumerate(cands, 1):
+                    ep = f"{c.entry_price:.2f}" if c.entry_price is not None else "N/A"
+                    sl = f"{c.stop_loss:.2f}" if c.stop_loss is not None else "N/A"
+                    lines.append(f"{i}) {c.label}｜入場 {ep}｜停損 {sl}｜{c.note or ''}")
+                val2 = QLabel("\n".join(lines)); val2.setWordWrap(True)
+                layout.addWidget(val2, row, 1, 1, 3); row += 1
+
+        # 多／空方案
+        def add_side_block(side_name: str, plan: TradePlan | None):
+            nonlocal row
+            if not plan: return
+            lbl = QLabel(f"{side_name}方案："); layout.addWidget(lbl, row, 0)
+            v = []
+            v.append(f"入場：{plan.entry_price:.2f}" if plan.entry_price is not None else "入場：N/A")
+            v.append(f"停損：{plan.stop_loss:.2f}" if plan.stop_loss is not None else "停損：N/A")
+            if plan.targets:
+                tg = ", ".join([f"{t:.2f}" for t in plan.targets]); v.append(f"停利目標：{tg}")
+            val = QLabel("；".join(v) + (f"\n{plan.plan}" if plan.plan else "")); val.setWordWrap(True)
+            layout.addWidget(val, row, 1, 1, 3); row += 1
+
+        add_side_block("多方", result.long)
+        add_side_block("空方", result.short)
+
+        lbl_r = QLabel("分析理由："); layout.addWidget(lbl_r, row, 0, 1, 4); row += 1
+        txt_r = QLabel(result.rationale); txt_r.setWordWrap(True)
+        layout.addWidget(txt_r, row, 0, 1, 4); row += 1
+
         if result.notes:
-            notes_label = QLabel("備註:")
-            layout.addWidget(notes_label, row_index, 0, 1, 4)
-            row_index += 1
-            notes_text = QLabel(result.notes)
-            notes_text.setWordWrap(True)
-            notes_text.setObjectName("CardNotes")
-            layout.addWidget(notes_text, row_index, 0, 1, 4)
-            row_index += 1
+            lbl_n = QLabel("備註："); layout.addWidget(lbl_n, row, 0, 1, 4); row += 1
+            txt_n = QLabel(result.notes); txt_n.setWordWrap(True); txt_n.setObjectName("CardNotes")
+            layout.addWidget(txt_n, row, 0, 1, 4); row += 1
 
-        # Metadata (Bottom right)
-        if result.model_used and result.response_time:
-            model_info = QLabel(f"Model: {result.model_used} | Time: {result.response_time:.2f}s")
-            model_info.setObjectName("CardMeta")
-            layout.addWidget(model_info, row_index, 0, 1, 4, Qt.AlignmentFlag.AlignRight)
+        if result.model_used and result.response_time is not None:
+            meta = QLabel(f"Model: {result.model_used} | Time: {result.response_time:.2f}s")
+            meta.setObjectName("CardMeta")
+            layout.addWidget(meta, row, 0, 1, 4, Qt.AlignmentFlag.AlignRight)

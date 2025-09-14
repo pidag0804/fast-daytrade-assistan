@@ -1,0 +1,96 @@
+/* assets/styles.qss */
+QWidget {
+    font-family: "Segoe UI", "Microsoft JhengHei", "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px;
+    color: #333;
+}
+
+QMainWindow {
+    background-color: #f8f9fa;
+}
+
+QToolBar {
+    background-color: #ffffff;
+    border-bottom: 1px solid #e1e1e1;
+    spacing: 8px;
+    padding: 5px;
+}
+
+QPushButton {
+    background-color: #0078D4;
+    color: white;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    font-weight: 500;
+}
+
+QPushButton:hover {
+    background-color: #005a9e;
+}
+
+QPushButton:pressed {
+    background-color: #004080;
+}
+
+QPushButton:disabled {
+    background-color: #cccccc;
+    color: #666666;
+}
+
+QListView {
+    background-color: #ffffff;
+    border: 1px solid #dee2e6;
+    padding: 5px;
+    border-radius: 5px;
+}
+
+QListView::item:selected {
+    background-color: #0078D4;
+    color: white;
+}
+
+
+QTextEdit, QPlainTextEdit {
+    background-color: #ffffff;
+    border: 1px solid #dee2e6;
+    padding: 8px;
+    border-radius: 5px;
+}
+
+/* --- Result Card Styling (ui.widgets.AnalysisCard) --- */
+QScrollArea {
+    border: 1px solid #dee2e6;
+}
+
+QFrame#ResultCard {
+    background-color: #ffffff;
+    border: 1px solid #ced4da;
+    border-radius: 8px;
+    margin: 10px 5px;
+    padding: 15px;
+}
+
+QLabel#CardTitle {
+    font-weight: bold;
+    font-size: 16px;
+    margin-bottom: 12px;
+    color: #495057;
+}
+
+/* Dynamic styling based on 'bias' property set in AnalysisCard */
+QLabel#CardBias[bias="多"] { color: #d9534f; font-weight: bold; font-size: 16px; }
+QLabel#CardBias[bias="空"] { color: #5cb85c; font-weight: bold; font-size: 16px; }
+QLabel#CardBias[bias="觀望"] { color: #6c757d; font-weight: bold; font-size: 16px; }
+
+QLabel#CardNotes {
+    font-style: italic;
+    color: #6c757d;
+    margin-top: 5px;
+}
+
+QLabel#CardMeta {
+    font-size: 11px;
+    color: #adb5bd;
+    margin-top: 10px;
+}

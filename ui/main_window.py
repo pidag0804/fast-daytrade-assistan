@@ -14,13 +14,12 @@ from PySide6.QtGui import QKeySequence, QImage, QPixmap, QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QListView,
     QTextEdit, QPushButton, QToolBar, QStatusBar, QApplication, QLabel,
-    QMenu, QMessageBox, QScrollArea, QComboBox, QLineEdit, QFormLayout
+    QMenu, QMessageBox, QScrollArea, QLineEdit, QFormLayout
 )
 
 from core.config import settings_manager
 from core.hotkeys import HotkeyManager
 from core.screenshot import capture_active_window, capture_region
-
 from core.imaging import ImageSaveOptions, save_image_async
 from core.ai_client.manager import ai_manager
 from core.models import AnalysisResult
@@ -68,7 +67,7 @@ class MainWindow(QMainWindow):
             h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
             logger.addHandler(h)
             logger.setLevel(logging.INFO)
-        logger.propagate = False  # 避免重覆列印
+        logger.propagate = False
 
         self.hotkey_manager = HotkeyManager(self)
         self.queue_model = UploadQueueModel(self)
@@ -88,7 +87,7 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(main)
         splitter = QSplitter(Qt.Horizontal); layout.addWidget(splitter)
 
-        # queue panel
+        # 左側：待上傳
         qpanel = QWidget(); ql = QVBoxLayout(qpanel)
         ql.addWidget(QLabel("待上傳區 (可拖曳排序、多選)"))
         self.queue_view = QListView()
@@ -99,8 +98,7 @@ class MainWindow(QMainWindow):
         self.queue_view.setResizeMode(QListView.Adjust)
         self.queue_view.setSpacing(6)
         self.queue_view.setDragEnabled(True)
-        self.queue_view.setAcceptDrops(True
-        )
+        self.queue_view.setAcceptDrops(True)
         self.queue_view.setDropIndicatorShown(True)
         self.queue_view.setDragDropMode(QListView.InternalMove)
         self.queue_view.setSelectionMode(QListView.ExtendedSelection)
@@ -109,39 +107,26 @@ class MainWindow(QMainWindow):
         ql.addWidget(self.queue_view)
         splitter.addWidget(qpanel)
 
-        # right panel
+        # 右側：結果 + 請求
         rpanel = QWidget(); rl = QVBoxLayout(rpanel)
 
-        # result cards
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         self.results_container = QWidget(); self.results_layout = QVBoxLayout(self.results_container)
         self.results_layout.setAlignment(Qt.AlignTop)
         scroll.setWidget(self.results_container)
         rl.addWidget(scroll, 1)
 
-        # user note
         self.user_input = QTextEdit(); self.user_input.setPlaceholderText("補充說明（例如持倉成本、消息）...")
         self.user_input.setMaximumHeight(80)
         rl.addWidget(self.user_input)
 
-        # meta row：股票代號/名稱 + 模式
+        # 股票 meta
         meta_box = QWidget(); meta_form = QFormLayout(meta_box)
         self.ed_symbol = QLineEdit(); self.ed_symbol.setPlaceholderText("例：2330")
         self.ed_name = QLineEdit(); self.ed_name.setPlaceholderText("例：台積電")
         meta_form.addRow("股票代號：", self.ed_symbol)
         meta_form.addRow("股票名稱：", self.ed_name)
-
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("分析模式："))
-        self.cb_mode = QComboBox(); self.cb_mode.addItems(["自動判斷", "當沖", "短波投資"])
-        saved_mode = str(settings_manager.get("AI/AnalysisMode") or "Auto")
-        idx = {"Auto": 0, "DayTrade": 1, "ShortSwing": 2}.get(saved_mode, 0)
-        self.cb_mode.setCurrentIndex(idx)
-        self.cb_mode.currentIndexChanged.connect(self._on_mode_changed)
-        mode_row.addWidget(self.cb_mode); mode_row.addStretch(1)
-
         rl.addWidget(meta_box)
-        rl.addLayout(mode_row)
 
         self.send_button = QPushButton("送出分析請求")
         self.send_button.clicked.connect(self.send_analysis_request)
@@ -150,7 +135,7 @@ class MainWindow(QMainWindow):
 
         splitter.setSizes([360, 980])
 
-        # toolbar
+        # 工具列
         tb = QToolBar("Main"); self.addToolBar(tb)
         act_f2 = QAction("截當前視窗", self); act_f2.triggered.connect(lambda: self._trigger_screenshot("window")); tb.addAction(act_f2)
         act_f3 = QAction("截並編輯", self); act_f3.triggered.connect(lambda: self._trigger_screenshot("edit")); tb.addAction(act_f3)
@@ -159,7 +144,7 @@ class MainWindow(QMainWindow):
         act_clear = QAction("清空待上傳", self); act_clear.triggered.connect(self.queue_model.clear_queue); tb.addAction(act_clear)
         act_settings = QAction("設定", self); act_settings.triggered.connect(self.open_settings); tb.addAction(act_settings)
 
-        # fallback shortcuts
+        # 快捷鍵備援
         for key, cb in (("F3", lambda: self._trigger_screenshot("edit")),
                         ("F4", lambda: self._trigger_screenshot("region"))):
             qs = QAction(self); qs.setShortcut(QKeySequence(key)); qs.triggered.connect(cb); self.addAction(qs)
@@ -325,32 +310,19 @@ class MainWindow(QMainWindow):
         name = self.ed_name.text().strip() or ""
         if not symbol or not name:
             guess_sym, guess_name = self._guess_symbol_name_from_paths(image_paths)
-            if not symbol:
-                symbol = guess_sym or ""
-            if not name:
-                name = guess_name or ""
-            # 若猜到就回填 UI
-            if symbol and not self.ed_symbol.text().strip():
-                self.ed_symbol.setText(symbol)
-            if name and not self.ed_name.text().strip():
-                self.ed_name.setText(name)
+            if not symbol and guess_sym: symbol = guess_sym
+            if not name and guess_name: name = guess_name
+            if symbol and not self.ed_symbol.text().strip(): self.ed_symbol.setText(symbol)
+            if name and not self.ed_name.text().strip(): self.ed_name.setText(name)
 
         meta_line = ""
         if symbol or name:
             meta_line = f"【股票】代號={symbol or 'null'}; 名稱={name or 'null'}\n"
 
+        # 使用者補充
         user_text = self.user_input.toPlainText().strip()
-        mode_idx = self.cb_mode.currentIndex()
-        if mode_idx == 1:
-            hint = ("【分析模式】當沖：請同時產出 long/short 兩套方案；提供 entry/stop/targets 與 plan；"
-                    "並給出 bias（多/空/觀望）。若 bias 為多或空，將該方向的 entry/stop 映射到頂層。")
-            user_text = (user_text + "\n\n" + hint) if user_text else hint
-        elif mode_idx == 2:
-            hint = ("【分析模式】短波投資：聚焦日K與30~60分K，提供 bias 與分批目標；"
-                    "說明隔日～數日持倉條件與移動停損邏輯。若 bias 為多或空，映射到頂層 entry/stop。")
-            user_text = (user_text + "\n\n" + hint) if user_text else hint
+        # 不再加入「分析模式」，AI 端已固定要求包含「當沖方案」
 
-        # 把 meta 放在最前面，讓模型權威採用
         payload_text = (meta_line + user_text) if meta_line else user_text
 
         self.set_loading_state(True)
@@ -392,10 +364,6 @@ class MainWindow(QMainWindow):
         if menu.actions():
             menu.exec(self.queue_view.viewport().mapToGlobal(pos))
 
-    def _on_mode_changed(self, idx: int):
-        value = {0: "Auto", 1: "DayTrade", 2: "ShortSwing"}.get(idx, "Auto")
-        settings_manager.set("AI/AnalysisMode", value); settings_manager.save_and_emit()
-
     def on_settings_changed(self):
         self._update_send_ready()
 
@@ -434,24 +402,16 @@ class MainWindow(QMainWindow):
             self.ed_name.setText(name)
 
     def _guess_symbol_name_from_paths(self, paths: list[str]) -> tuple[str | None, str | None]:
-        """
-        依常見檔名規則猜測：
-        - 4 碼台股代號：r'\\b(\\d{4})\\b'
-        - 名稱：去除代號與常見分隔後的中文字/英文片段
-        """
         sym = None
         name = None
         for p in paths:
             fname = os.path.basename(p)
             base, _ = os.path.splitext(fname)
-            # 取第一個 4 碼數字
             m = re.search(r'(?<!\d)(\d{4})(?!\d)', base)
             if m and not sym:
                 sym = m.group(1)
-            # 嘗試把代號與數字、時間戳移除，保留中英文
-            tmp = re.sub(r'[\d_\\-]+', ' ', base)  # 移除數字/底線/連字號
+            tmp = re.sub(r'[\d_@()\-\[\]{}]+', ' ', base)
             tmp = re.sub(r'\s+', ' ', tmp).strip()
-            # 常見 pattern：台積電、TSMC、MediaTek、長榮 等
             m2 = re.search(r'([A-Za-z]{2,}|[\u4e00-\u9fa5]{2,})', tmp)
             if m2 and not name:
                 name = m2.group(1)

@@ -2,8 +2,9 @@
 from PySide6.QtWidgets import QWidget, QFrame, QLabel, QGridLayout
 from PySide6.QtGui import QPainter, QPen, QColor, QGuiApplication
 from PySide6.QtCore import Qt, QRect, Signal
+
 from core.models import (
-    AnalysisResult, TradePlan, PlanBreakdown, OperationCycle,
+    AnalysisResult, SidePlan,
 )
 
 # ----------- 擷取工具 -----------
@@ -58,7 +59,12 @@ class SnippingTool(QWidget):
             rect = QRect(self.begin, self.end).normalized()
             if rect.width() > 10 and rect.height() > 10:
                 virtual_origin = QGuiApplication.primaryScreen().virtualGeometry().topLeft()
-                monitor_dict = {'left': virtual_origin.x() + rect.left(),'top': virtual_origin.y() + rect.top(),'width': rect.width(),'height': rect.height()}
+                monitor_dict = {
+                    'left': virtual_origin.x() + rect.left(),
+                    'top': virtual_origin.y() + rect.top(),
+                    'width': rect.width(),
+                    'height': rect.height()
+                }
                 self.hide()
                 self.snipping_finished.emit(monitor_dict)
             self.close()
@@ -79,10 +85,36 @@ class AnalysisCard(QFrame):
     def setup_ui(self, result: AnalysisResult):
         layout = QGridLayout(self)
 
-        title = QLabel(f"交易建議 (信心: {result.confidence*100:.0f}%, 風險: {result.risk_score}/5)")
+        # --- 小工具 ---
+        def fmt_num(x):
+            try:
+                return f"{float(x):.2f}"
+            except Exception:
+                return "N/A"
+
+        def fmt_pct(x):
+            try:
+                return f"{float(x)*100:.1f}%"
+            except Exception:
+                return "—"
+
+        def get(obj, key, default=None):
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        conf_pct = int(round(((result.confidence or 0.0) * 100)))
+        risk_txt = f"{getattr(result, 'risk_score', 0)}/5"
+
+        # 標的（代號 / 名稱） + 標題
+        subject = ""
+        if getattr(result, "symbol", None) or getattr(result, "name", None):
+            subject = f"標的：{result.symbol or '-'} / {result.name or '-'}  |  "
+        title = QLabel(f"{subject}交易建議 (信心: {conf_pct}%, 風險: {risk_txt})")
         title.setObjectName("CardTitle")
         layout.addWidget(title, 0, 0, 1, 4)
 
+        # 方向 / 入場 / 停損 / 留倉
         bias_label = QLabel("建議方向:")
         bias_value = QLabel(result.bias)
         bias_value.setObjectName("CardBias")
@@ -90,12 +122,12 @@ class AnalysisCard(QFrame):
         layout.addWidget(bias_value, 1, 1)
 
         entry_label = QLabel("建議入場:")
-        entry_value = QLabel(f"{result.entry_price:.2f}" if result.entry_price is not None else "N/A")
+        entry_value = QLabel(fmt_num(result.entry_price) if result.entry_price is not None else "N/A")
         layout.addWidget(entry_label, 2, 0)
         layout.addWidget(entry_value, 2, 1)
 
         sl_label = QLabel("建議停損:")
-        sl_value = QLabel(f"{result.stop_loss:.2f}" if result.stop_loss is not None else "N/A")
+        sl_value = QLabel(fmt_num(result.stop_loss) if result.stop_loss is not None else "N/A")
         layout.addWidget(sl_label, 3, 0)
         layout.addWidget(sl_value, 3, 1)
 
@@ -119,8 +151,71 @@ class AnalysisCard(QFrame):
         add_block("結構：", result.structure)
         add_block("動能：", result.momentum)
         add_block("關鍵價位：", result.key_levels)
+
+        # --- BBand 專區 ---
+        bb = getattr(result, "bband", None)
+        if bb:
+            lbl = QLabel("BBand（布林）：")
+            layout.addWidget(lbl, row, 0)
+            lines = []
+            if get(bb, "period", None) or get(bb, "dev", None):
+                lines.append(f"參數：{get(bb,'period','?')}/{get(bb,'dev','?')}")
+            ma = get(bb, "ma", None)
+            up = get(bb, "upper", None)
+            lo = get(bb, "lower", None)
+            if ma or up or lo:
+                parts = []
+                if ma is not None: parts.append(f"中軌≈{fmt_num(ma)}")
+                if up is not None: parts.append(f"上軌≈{fmt_num(up)}")
+                if lo is not None: parts.append(f"下軌≈{fmt_num(lo)}")
+                if parts: lines.append("、".join(parts))
+            width = get(bb, "width", None)
+            if width is not None:
+                lines.append(f"帶寬：{fmt_pct(width)}")
+            pb = get(bb, "percent_b", None) or get(bb, "%b", None)
+            if pb is not None:
+                try:
+                    pbv = float(pb)
+                    lines.append(f"%B：{pbv:.2f}（0=下軌, 0.5=中軌, 1=上軌）")
+                except Exception:
+                    pass
+            sq = get(bb, "squeeze", None)
+            if sq is not None:
+                sqtxt = "狹縮" if sq else "非狹縮"
+                r = get(bb, "squeeze_rank_1y", None)
+                if r is not None:
+                    sqtxt += f"（近1年分位≈{fmt_pct(r)}）"
+                lines.append(sqtxt)
+            note = (get(bb, "note", "") or "").strip()
+            if note:
+                lines.append(note)
+            val = QLabel("；".join(lines) if lines else "—")
+            val.setWordWrap(True)
+            layout.addWidget(val, row, 1, 1, 3); row += 1
+
         add_block("交易計畫（總結）：", result.trade_plan)
         add_block("加分訊號：", result.bonus_signals)
+        
+        # --- 籌碼分析 ---
+        chips = getattr(result, "chips", [])
+        if chips:
+            score_txt = f" (綜合評分: {result.chip_score}/5)" if getattr(result, 'chip_score', None) is not None else ""
+            lbl = QLabel(f"籌碼分析：{score_txt}")
+            
+            lines = []
+            for chip in chips:
+                line = (f"<b>{getattr(chip, 'period', '?')}</b>: "
+                        f"{getattr(chip, 'pattern', 'N/A')} "
+                        f"(評分: {getattr(chip, 'score', '?')}/5). "
+                        f"<i>{getattr(chip, 'comment', '')}</i>")
+                lines.append(line)
+            
+            val = QLabel("<br>".join(lines))
+            val.setWordWrap(True)
+            
+            layout.addWidget(lbl, row, 0)
+            layout.addWidget(val, row, 1, 1, 3)
+            row += 1
 
         # 交易計畫（條列）
         if result.plan_breakdown:
@@ -134,7 +229,24 @@ class AnalysisCard(QFrame):
             val = QLabel("\n".join(lines) if lines else "—"); val.setWordWrap(True)
             layout.addWidget(val, row, 1, 1, 3); row += 1
 
-        # 操作週期
+        # 位階判斷 / 操作週期
+        pos = getattr(result, "position", None)
+        if pos:
+            lbl = QLabel("位階判斷：")
+            layout.addWidget(lbl, row, 0)
+            parts = [f"{getattr(pos, 'level', '—')}"]
+            try:
+                parts.append(f"距52W高 {fmt_pct(getattr(pos, 'pct_from_52w_high', None))}")
+                parts.append(f"距52W低 {fmt_pct(getattr(pos, 'pct_from_52w_low', None))}")
+                parts.append(f"距MA200 {fmt_pct(getattr(pos, 'pct_from_ma200', None))}")
+                parts.append(f"距MA60 {fmt_pct(getattr(pos, 'pct_from_ma60', None))}")
+                parts.append(f"AVWAP距離 {fmt_pct(getattr(pos, 'avwap_from_pivot', None))}")
+            except Exception:
+                pass
+            val = QLabel("；".join(parts))
+            val.setWordWrap(True)
+            layout.addWidget(val, row, 1, 1, 3); row += 1
+
         if result.operation_cycle:
             oc = result.operation_cycle
             lbl = QLabel("操作週期：")
@@ -147,58 +259,25 @@ class AnalysisCard(QFrame):
             val = QLabel("\n".join(lines) if lines else "—"); val.setWordWrap(True)
             layout.addWidget(val, row, 1, 1, 3); row += 1
 
-        # 位階判斷
-        pos = getattr(result, "position", None)
-        if pos:
-            lbl = QLabel("位階判斷：")
-            layout.addWidget(lbl, row, 0)
-            parts = [f"{getattr(pos, 'level', '—')}"]
-            try:
-                def fmt_pct(x): return f"{x*100:.1f}%" if x is not None else "—"
-                parts.append(f"距52W高 {fmt_pct(pos.pct_from_52w_high)}")
-                parts.append(f"距52W低 {fmt_pct(pos.pct_from_52w_low)}")
-                parts.append(f"距MA200 {fmt_pct(pos.pct_from_ma200)}")
-                parts.append(f"距MA60 {fmt_pct(pos.pct_from_ma60)}")
-                parts.append(f"AVWAP距離 {fmt_pct(pos.avwap_from_pivot)}")
-            except Exception:
-                pass
-            val = QLabel("；".join(parts))
-            val.setWordWrap(True)
-            layout.addWidget(val, row, 1, 1, 3); row += 1
-
-        # 低位階買入評估 + 入場建議
-        if getattr(result, "buy_suitable", None) is not None or getattr(result, "entry_candidates", None):
-            lbl = QLabel("低位階買入評估：")
-            layout.addWidget(lbl, row, 0)
-            ok_txt = "適合" if result.buy_suitable else "不適合" if result.buy_suitable is False else "—"
-            reason = (result.buy_reason or "").strip()
-            text = ok_txt + (f"（{reason}）" if reason else "")
-            val = QLabel(text); val.setWordWrap(True)
-            layout.addWidget(val, row, 1, 1, 3); row += 1
-
-            cands = getattr(result, "entry_candidates", []) or []
-            if cands:
-                lbl2 = QLabel("入場建議：")
-                layout.addWidget(lbl2, row, 0)
-                lines = []
-                for i, c in enumerate(cands, 1):
-                    ep = f"{c.entry_price:.2f}" if c.entry_price is not None else "N/A"
-                    sl = f"{c.stop_loss:.2f}" if c.stop_loss is not None else "N/A"
-                    lines.append(f"{i}) {c.label}｜入場 {ep}｜停損 {sl}｜{c.note or ''}")
-                val2 = QLabel("\n".join(lines)); val2.setWordWrap(True)
-                layout.addWidget(val2, row, 1, 1, 3); row += 1
-
         # 多／空方案
-        def add_side_block(side_name: str, plan: TradePlan | None):
+        def add_side_block(side_name: str, plan: SidePlan | None):
             nonlocal row
-            if not plan: return
+            if not plan:
+                return
             lbl = QLabel(f"{side_name}方案："); layout.addWidget(lbl, row, 0)
             v = []
-            v.append(f"入場：{plan.entry_price:.2f}" if plan.entry_price is not None else "入場：N/A")
-            v.append(f"停損：{plan.stop_loss:.2f}" if plan.stop_loss is not None else "停損：N/A")
+            v.append(f"入場：{fmt_num(plan.entry_price)}" if plan.entry_price is not None else "入場：N/A")
+            v.append(f"停損：{fmt_num(plan.stop_loss)}" if plan.stop_loss is not None else "停損：N/A")
             if plan.targets:
-                tg = ", ".join([f"{t:.2f}" for t in plan.targets]); v.append(f"停利目標：{tg}")
-            val = QLabel("；".join(v) + (f"\n{plan.plan}" if plan.plan else "")); val.setWordWrap(True)
+                try:
+                    tg = ", ".join([fmt_num(t) for t in plan.targets])
+                except Exception:
+                    tg = ""
+                if tg:
+                    v.append(f"停利目標：{tg}")
+            detail = "；".join(v)
+            detail = detail + (f"\n{plan.plan}" if getattr(plan, "plan", "") else "")
+            val = QLabel(detail); val.setWordWrap(True)
             layout.addWidget(val, row, 1, 1, 3); row += 1
 
         add_side_block("多方", result.long)

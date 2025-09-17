@@ -9,7 +9,7 @@ import re
 import os
 from pathlib import Path
 from abc import ABC, abstractmethod
-from typing import List, Optional, Any, Tuple
+from typing import List, Optional, Tuple
 
 from pydantic import ValidationError
 from core.config import settings_manager
@@ -18,76 +18,99 @@ from core.models import AnalysisResult
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """
-你是一位嚴謹的台股分析助手。依據走勢圖（可能包含日K、30/60分、量能、均線、VWAP、五檔）與使用者提供的數字，產出**可執行**的計畫。
+你是一位嚴謹的台股分析助手。依據走勢圖（可能包含日K、30/60分、量能、均線、VWAP、五檔、BBand）與使用者提供的數字，產出**可執行**的計畫。
 
 【通用步驟】
-1) 讀圖：當前價、VWAP、均線、高低點、量能。
-2) 判斷：結構（趨勢/箱體/型態/位置關係）、動能（放量/縮量、延續/鈍化）。
-3) 計畫：入場觸發與**明確停損價**（數字），停利目標可多段。
+1) 讀圖：當前價、VWAP、AVWAP、均線、高低點、量能、BBand。
+2) 判斷：
+    - **多時間框架(MTF)**：結合長線（如 5/15分K）判斷趨勢與結構，短線（如 1分K）找精準進場點。
+    - **結構**：趨勢、箱體、型態、位置關係。
+    - **動能**：放量/縮量、延續/鈍化。
+3) 計畫：
+    - **入場觸發**：明確的觸發條件。
+    - **停損**：**明確停損價**（數字），優先採技術停損（如關鍵高低點外緣），或以 ATR/布林帶寬度自適應調整。若無明確參考，才預設 2% 為上限。
+    - **停利**：可設 2~3 段目標（如 1R, 2R）。
 
-【分析模式】
-- 當沖：同時產出 long/short；比較後給出 bias（多/空/觀望）；若為多或空，將該方向的 entry/stop 同步到頂層。
-- 短波投資：偏重日K與 30~60分結構、隔日~數日持倉；同樣給出 bias，可同時提供 long/short 與分批目標；可 `hold_overnight = true`。
+【當沖方案（必填、請放在輸出重心）】
+- 一律視為「當日內平倉」，`hold_overnight=false`。
+- 請以 1~5 分K、VWAP/開盤AVWAP、當日高低/開盤區間(OR)/分時箱體、BBand 為核心依據。
+- **在 `trade_plan` 的第一行，明確寫：`當沖方向：多|偏多|空|偏空`（四選一）**，並附一句理由。
+- 同時提供 `long` 與 `short`：
+  - 每個都要有 `entry_price`、`stop_loss`、`targets`。
+- 比較兩方案後，設定頂層 `bias`：
+  - 若方向為「偏多」→ `bias="多"`；「偏空」→ `bias="空"`；其餘依字義。
+  - 若 `bias` 為多或空，請把該方向的 `entry/stop` 同步到頂層 `entry_price/stop_loss`。
+- `key_levels` 盡量給出具體價位（VWAP、AVWAP、當日高低、開盤區間高低(OR)、箱體上下緣、昨高、昨低、整數關卡）。
+
+【BBand（布林軌道）專項 — 務必提供】
+- **參數調整**：預設 `period=20, dev=2`。但請依波動與分K動態評估，如：1分K 可用 20~30 週期；5分K 或高波動股可用 10~20 週期。若判讀不同，請註明。
+- 請填 `bband` 物件，- 至少包含：
+  - `ma`（中軌估值）、`upper`、`lower`
+  - `width`：帶寬（(upper-lower)/ma，以小數表示）
+  - `%b`（0~1，若超出可 <0 或 >1）
+  - `squeeze`：是否為狹縮，並附 `bandwidth_rank_session`（日內帶寬分位數 0~1）。
+  - **擠壓量化**：`squeeze=true` 的條件為 `width` 處於近期低點（如 `bandwidth_rank_session < 0.2`）且 MA20 走平。
+  - `note`：用 1~2 句說明「走帶/擠壓/均值回歸/突破」型態與交易含義。
+- **判讀與出場指引**：
+  - **走帶（walking the band）**：標準為「**連續3根K棒**收盤貼近上/下軌（如 %B > 0.8 或 < 0.2），且**量能同步驗證**」。**出場規則**：順勢分段出場，直到價格**明確收盤跌破/站上中軌**為止。
+  - **擠壓（squeeze）**：帶寬壓縮，預備突破。**策略切換**：在計畫中註明，一旦擠壓後出現**帶量突破**，策略應從**均值回歸（反轉）切換為順勢追蹤**。
+  - **均值回歸（mean reversion）**：%B 觸及 0 或 1 且量能鈍化。**出場規則**：以**中軌/MVWAP** 為主要回歸目標。
+  - **假突破**：標準為「價格衝出軌道但**收盤回帶內**，且**量能背離**（未顯著放大），**隔根K棒未延續**方向」。可反向短打，停損設於影線外緣。
+
+【倉位控管（務必填寫）】
+- 依據 `risk_score`、帶寬狀態、波動性，在 `position_size_rule` 中提供倉位建議。例如：「高風險/帶寬放大 → 輕倉」、「低風險/擠壓突破 → 標準倉位」。
+
+【籌碼分析（若有圖）】
+- 你會收到近 5/10/20/60 日的籌碼流向圖。
+- 必須分析「外資」、「投信」、「散戶」的買賣超趨勢。
+- **識別模式**：明確判斷並描述屬於以下哪種情境，或其他你觀察到的模式：
+  1. 外資賣，投信買（土洋對作）
+  2. 投信賣，外資買（土洋對作）
+  3. 外資、投信同買（雙買）
+  4. 外資、投信同賣（雙賣）
+  5. 散戶賣，法人（任一）買（籌碼集中）
+  6. 法人（任一）賣，散戶買（籌碼渙散）
+- **輸出**：
+  - 在 `chips` 陣列中，為每個週期（5日、10日...）新增一個物件。
+  - `pattern` 欄位需簡潔描述上述模式。
+  - `comment` 欄位提供你的分析洞見。
+  - `score` 欄位針對該週期的籌碼健康度評分 (1-5分，5分最佳)。
+  - 最後，在 `chip_score` 欄位給出一個綜合總評分 (1-5分)。
+
+【加分訊號（務必填寫 bonus_signals）】
+- 補充說明，例如：**跳空缺口**、**重大新聞**、**接近漲跌停（風險保護）**，或圖中可見的**分時籌碼/委託流向**（大單、內外盤比）等輔助信號。
 
 【股票識別規範（極重要）】
-- 你會在使用者訊息開頭看見可能的中繼資料（meta），例如：
-  【股票】代號=2330; 名稱=台積電
-- 若 meta 中提供 `代號` 或 `名稱`，**視為權威來源**：請將其分別填入輸出 JSON 的 `"symbol"` 與 `"name"`，不可擅改。
-- 若 meta 未提供，請嘗試從以下來源辨識：
-  1) 圖表標題、頁籤、浮水印、左上角品名（常見：券商看盤軟體標題列）。
-  2) 影像檔名（例：`2330_TSMC_5m.png`、`台積電-2330-日K.webp`）。
-- 仍無法判斷時，`symbol` 或 `name` 允許為 `null`，但需在 `notes` 簡述原因，並補充：
-  - `symbol_guess_candidates`: 可能的代號陣列（如從圖中文字/檔名擷取到的 4 碼），無則給空陣列。
-  - `name_guess_candidates`: 可能的名稱陣列，無則給空陣列。
+- 使用者訊息開頭的 meta `代號`、`名稱`，**視為權威且覆蓋模型推斷**。
 
 【位階判斷（務必填寫 position）】
-- 盡量利用「#numbers」區塊的數字；若無，從圖推定，缺值= null。
-- 量化欄位定義：
-  - pct_from_52w_high = (price - 52wHigh) / 52wHigh
-  - pct_from_52w_low = (price - 52wLow) / 52wLow
-  - pct_from_ma200 = (price - MA200) / MA200
-  - pct_from_ma60  = (price - MA60)  / MA60
-  - avwap_from_pivot = (price - AVWAP) / AVWAP
-  - volume_20d_ratio = todayVol / avg20Vol
-- **位階等級**（指引，非絕對）：
-  - 低位階：位於 52w 區間下 30% 以內，或接近/下穿 MA200（±3%），或 AVWAP 下方但出現收復跡象；RSI14 常 <55。
-  - 高位階：位於 52w 區間上 20% 以內，或高於 MA200 超過 ~10%，連續長紅或加速段；RSI14 常 >60。
-  - 其餘歸為 中位階。
-- 將判斷結果填入 `position.level`，並盡量填滿各數值欄位。
+- 盡量填滿數值。
 
 【低位階買入評估（必做）】
-- 若 `position.level = 低位階`，請產出：
-  - `buy_suitable`: 是否適合買入（結構有無頸線/箱底、是否收復關鍵均線/VWAP、量能是否轉強）。
-  - `entry_candidates`: 2~3 個方案（突破、回測、VWAP/AVWAP收復等），每個包含 entry_price、stop_loss、note。
-  - `buy_reason`: 精要說明風報、結構、動能與風險。
-- 若非低位階，`buy_suitable=false`，簡述理由（例如：高位階風險/乖離過大/量價失衡）。
+- 若判定為低位階，產出 `entry_candidates` 與 `buy_reason`；否則 `buy_suitable=false`。
 
 【五段重點（務必填寫）】
-- `structure`、`momentum`、`key_levels`（盡量給**數字**）、`trade_plan`（總結）、`bonus_signals`
-- 另外填 `plan_breakdown`（進場/停損/停利）與 `operation_cycle`（動能/成交量/法人籌碼/籌碼集中度）
+- `structure`、`momentum`、`key_levels`、`trade_plan`、`bonus_signals`
+- 並填 `plan_breakdown` 與 `operation_cycle`
 
 【容錯】
-- 圖/數據不足時，允許數值為 null、confidence 降低並在 notes 說明。
+- 圖/數據不足時，允許數值為 `null`，`confidence` 保守；於 `notes` 說明不確定性。
 
 【輸出（只輸出 JSON）】
 {
   "symbol": string | null,
   "name": string | null,
-
   "bias": "多" | "空" | "觀望",
   "entry_price": number | null,
   "stop_loss": number | null,
-  "hold_overnight": true | false | null,
-
+  "hold_overnight": false,
   "structure": string,
   "momentum": string,
   "key_levels": string,
   "trade_plan": string,
   "bonus_signals": string,
-
   "plan_breakdown": {"entry": string, "stop": string, "take_profit": string} | null,
   "operation_cycle": {"momentum": string, "volume": string, "institutions": string, "concentration": string} | null,
-
   "position": {
     "level": "低位階" | "中位階" | "高位階",
     "pct_from_52w_high": number | null,
@@ -100,23 +123,44 @@ SYSTEM_PROMPT = """
     "volume_20d_ratio": number | null,
     "near_vpoc": true | false | null
   } | null,
-
+  "position_size_rule": string,
   "buy_suitable": true | false | null,
   "buy_reason": string,
   "entry_candidates": [
     {"label": string, "entry_price": number | null, "stop_loss": number | null, "note": string}
   ],
-
-  "long": {"entry_price": number | null, "stop_loss": number | null, "targets": number[], "plan": string} | null,
-  "short": {"entry_price": number | null, "stop_loss": number | null, "targets": number[], "plan": string} | null,
-
+  "long": {"entry_price": number | null, "stop_loss": null, "targets": number[], "plan": string} | null,
+  "short": {"entry_price": number | null, "stop_loss": null, "targets": number[], "plan": string} | null,
+  "bband": {
+    "period": number | null,
+    "dev": number | null,
+    "ma": number | null,
+    "upper": number | null,
+    "lower": number | null,
+    "width": number | null,
+    "%b": number | null,
+    "squeeze": true | false | null,
+    "bandwidth_rank_session": number | null,
+    "note": string
+  },
   "rationale": string,
   "risk_score": 1 | 2 | 3 | 4 | 5,
   "confidence": number,
   "notes": string,
-
-  "symbol_guess_candidates": string[],
-  "name_guess_candidates": string[]
+  "chips": [
+    {
+      "period": "5日",
+      "foreign": -5000,
+      "investment": 8000,
+      "retail": -3000,
+      "pattern": "外資賣，投信買",
+      "comment": "投信積極承接外資賣壓，短線有支撐。",
+      "score": 4
+    }
+  ],
+  "chip_score": 4,
+  "symbol_guess_candidates": [],
+  "name_guess_candidates": []
 }
 """
 
@@ -186,14 +230,13 @@ class AIClientBase(ABC):
         if not self.client and not self.initialize_client():
             raise RuntimeError(f"{self.provider_name} Client not initialized (check API key).")
 
-        # 從使用者文字擷取 meta（代號/名稱），留待後處理強制補齊
+        # 擷取 meta（代號/名稱），供後處理補齊/覆蓋
         meta_symbol, meta_name = self._extract_symbol_name_meta(user_text)
 
         user_text_aug = self._augment_user_text(image_paths, user_text)
         model = self.determine_model(len(image_paths), user_text_aug)
         if not model:
             raise RuntimeError(f"{self.provider_name} models are not configured in settings.")
-
         logger.info(f"Starting analysis with {self.provider_name}. Strategy: {self.strategy}. Model: {model}")
         try:
             start = time.time()
@@ -201,8 +244,8 @@ class AIClientBase(ABC):
             dur = time.time() - start
             logger.info(f"API done in {dur:.2f}s (model={model})")
 
-            # --- 後處理：確保 symbol/name 存在 ---
-            content = self._ensure_symbol_name(content, meta_symbol, meta_name, image_paths)
+            # 後處理：symbol/name 覆蓋、當沖預設、欄位正規化（含 long/short.plan）
+            content = self._finalize_json(content, meta_symbol, meta_name, image_paths)
 
             result = self._parse_and_validate(content)
             result.model_used = f"{self.provider_name}/{model}"
@@ -215,7 +258,7 @@ class AIClientBase(ABC):
                     start = time.time()
                     content = await self._call_api(self.model_fast, image_paths, user_text_aug)
                     dur = time.time() - start
-                    content = self._ensure_symbol_name(content, meta_symbol, meta_name, image_paths)
+                    content = self._finalize_json(content, meta_symbol, meta_name, image_paths)
                     result = self._parse_and_validate(content)
                     result.model_used = f"{self.provider_name}/{self.model_fast}"
                     result.response_time = dur
@@ -225,14 +268,10 @@ class AIClientBase(ABC):
 
     # ---------- helpers ----------
     def _augment_user_text(self, image_paths: List[str], user_text: str) -> str:
-        # 保留你原有文本，不再自動加入分析模式提示，避免干擾 meta 行的辨識
+        # 直接使用使用者文字；不再插入「分析模式」
         return (user_text or "").strip()
 
     def _extract_symbol_name_meta(self, text: str) -> Tuple[Optional[str], Optional[str]]:
-        """
-        從使用者文字中擷取：
-        形如：【股票】代號=2330; 名稱=台積電
-        """
         if not text:
             return None, None
         m = re.search(r"【股票】\s*代號\s*=\s*([^;\\\n]+)\s*;\s*名稱\s*=\s*([^\n]+)", text)
@@ -245,17 +284,14 @@ class AIClientBase(ABC):
         return sym, name
 
     def _guess_from_paths(self, image_paths: List[str]) -> Tuple[Optional[str], Optional[str]]:
-        """從影像檔名猜測 4 碼代號與可能名稱片段。"""
         sym = None
         name = None
         for p in image_paths:
             fname = os.path.basename(p)
             base, _ = os.path.splitext(fname)
-            # 代號：第一個 4 碼數字
             m = re.search(r'(?<!\d)(\d{4})(?!\d)', base)
             if m and not sym:
                 sym = m.group(1)
-            # 名稱：去除數字與常見符號後保留中英文片段
             tmp = re.sub(r'[\d_@()\-\[\]{}]+', ' ', base)
             tmp = re.sub(r'\s+', ' ', tmp).strip()
             m2 = re.search(r'([A-Za-z]{2,}|[\u4e00-\u9fa5]{2,})', tmp)
@@ -265,14 +301,26 @@ class AIClientBase(ABC):
                 break
         return sym, name
 
-    def _ensure_symbol_name(self, content: str, meta_symbol: Optional[str], meta_name: Optional[str], image_paths: List[str]) -> str:
+    def _finalize_json(
+        self,
+        content: str,
+        meta_symbol: Optional[str],
+        meta_name: Optional[str],
+        image_paths: List[str],
+    ) -> str:
         """
-        解析模型 JSON 字串；若缺 symbol/name 或為空，使用 meta 或檔名猜測補齊，再回寫為 JSON 字串。
+        後處理：
+        - **使用者輸入優先**：若 meta 帶入代號/名稱，直接覆蓋模型值；否則才用模型→檔名猜測補齊
+        - 一律 daytrade：hold_overnight=False
+        - 若 `trade_plan` 未含「當沖方向：...」，自動補一行（依 bias 推定）
+        - long/short/top-level 停損缺失 → 預設 2% 停損；targets 缺失 → 補 1%、2% 兩段
+        - long/short.plan 為 None → 自動生成一行摘要
+        - confidence 標準化到 [0,1]；risk_score 夾到 [1,5]
+        - 若 bias 回「偏多/偏空」→ 映射為「多/空」
         """
         if not content:
             return content
 
-        # 嘗試剝除 ```json 區塊
         txt = content.strip()
         if txt.startswith("```json"):
             txt = txt.removeprefix("```json").removesuffix("```").strip()
@@ -282,32 +330,146 @@ class AIClientBase(ABC):
             if not isinstance(data, dict):
                 return content
         except Exception:
-            # 若非 JSON，就原樣返回（讓 _parse_and_validate 回報錯）
             return content
 
-        # 讀現有值
-        symbol = data.get("symbol")
-        name = data.get("name")
-
-        # 若缺，先用 meta 補
-        if not symbol and meta_symbol:
-            symbol = meta_symbol
-        if not name and meta_name:
-            name = meta_name
-
-        # 還是缺，從檔名猜
+        # ---- symbol/name：使用者輸入優先覆蓋 ----
+        symbol = meta_symbol if meta_symbol is not None else data.get("symbol")
+        name = meta_name if meta_name is not None else data.get("name")
         if not symbol or not name:
             guess_sym, guess_name = self._guess_from_paths(image_paths)
             if not symbol and guess_sym:
                 symbol = guess_sym
             if not name and guess_name:
                 name = guess_name
-
-        # 寫回去（至少要有 key，沒有就填 null）
         data["symbol"] = symbol if symbol else None
         data["name"] = name if name else None
 
-        # 若模型有提供 candidates 欄位則沿用，沒有就可選擇不加；這裡不強制新增
+        # ---- 一律當沖 ----
+        data["hold_overnight"] = False
+
+        # ---- bias 正規化（偏多/偏空 → 多/空）----
+        bias = (data.get("bias") or "").strip()
+        if bias in ("偏多", "多偏", "看多偏多"):
+            bias = "多"
+        elif bias in ("偏空", "空偏", "看空偏空"):
+            bias = "空"
+        elif bias not in ("多", "空", "觀望", ""):
+            tp = (data.get("trade_plan") or "")
+            m = re.search(r"當沖方向：\s*(多|偏多|空|偏空)", tp)
+            if m:
+                bias = "多" if m.group(1) in ("多", "偏多") else "空"
+        data["bias"] = bias or "觀望"
+
+        # ---- trade_plan 首行加入方向 ----
+        direction = None
+        tp = (data.get("trade_plan") or "")
+        m = re.search(r"當沖方向：\s*(多|偏多|空|偏空)", tp)
+        if m:
+            direction = m.group(1)
+        else:
+            if data["bias"] == "多":
+                direction = "偏多"
+            elif data["bias"] == "空":
+                direction = "偏空"
+        if direction:
+            header = f"當沖方向：{direction}"
+            tp = (tp or "").strip()
+            data["trade_plan"] = header + ("\n" + tp if tp else "（綜合結構與動能，預設 2% 停損）")
+
+        # ---- helpers ----
+        def _to_float(x) -> Optional[float]:
+            if x is None:
+                return None
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        def _norm_targets(tgts, entry: Optional[float], is_long: bool) -> list:
+            arr: list[float] = []
+            if isinstance(tgts, list):
+                for t in tgts:
+                    v = _to_float(t)
+                    if v is not None:
+                        arr.append(round(v, 2))
+            if not arr and entry is not None:
+                e = float(entry)
+                arr = ([round(e * 1.01, 2), round(e * 1.02, 2)] if is_long
+                       else [round(e * 0.99, 2), round(e * 0.98, 2)])
+            return arr
+
+        def _mk_plan_sentence(is_long: bool, entry: Optional[float], stop: Optional[float], tgts: list[float]) -> str:
+            side_txt = "做多計畫" if is_long else "做空計畫"
+            parts = []
+            if entry is not None:
+                parts.append(f"入場 {entry:.2f}")
+            if stop is not None:
+                if entry:
+                    pct = abs(stop / entry - 1.0) * 100.0
+                    parts.append(f"停損 {stop:.2f}（約{pct:.1f}%）")
+                else:
+                    parts.append(f"停損 {stop:.2f}")
+            if tgts:
+                tg = "、".join(f"{x:.2f}" for x in tgts)
+                parts.append(f"目標 {tg}")
+            if not parts:
+                return f"{side_txt}：依 VWAP、當日高低與箱體關鍵價動態調整。"
+            return f"{side_txt}：" + "，".join(parts) + "。"
+
+        # ---- 預設 2% 停損 & targets & plan 文字 ----
+        def _ensure_side(side: dict | None, is_long: bool) -> dict | None:
+            if not isinstance(side, dict):
+                return side
+            entry = _to_float(side.get("entry_price"))
+            stop = _to_float(side.get("stop_loss"))
+            if entry is not None and stop is None:
+                stop = entry * (0.98 if is_long else 1.02)
+                side["stop_loss"] = round(stop, 2)
+            tgts = _norm_targets(side.get("targets"), entry, is_long)
+            side["targets"] = tgts
+            plan = side.get("plan")
+            if not isinstance(plan, str) or not plan.strip():
+                side["plan"] = _mk_plan_sentence(is_long, entry, stop, tgts)
+            return side
+
+        data["long"] = _ensure_side(data.get("long"), True)
+        data["short"] = _ensure_side(data.get("short"), False)
+
+        # ---- 同步頂層 entry/stop ----
+        if data["bias"] == "多" and isinstance(data.get("long"), dict):
+            if data.get("entry_price") is None:
+                data["entry_price"] = data["long"].get("entry_price")
+            if data.get("stop_loss") is None:
+                data["stop_loss"] = data["long"].get("stop_loss")
+        elif data["bias"] == "空" and isinstance(data.get("short"), dict):
+            if data.get("entry_price") is None:
+                data["entry_price"] = data["short"].get("entry_price")
+            if data.get("stop_loss") is None:
+                data["stop_loss"] = data["short"].get("stop_loss")
+
+        # ---- confidence → [0,1] ----
+        conf = data.get("confidence")
+        if conf is not None:
+            try:
+                v = float(conf)
+                if v > 1.0: v /= 100.0
+                if v < 0.0: v = 0.0
+                if v > 1.0: v = 1.0
+                data["confidence"] = v
+            except Exception:
+                data["confidence"] = None
+
+        # ---- risk_score → 1..5 ----
+        rs = data.get("risk_score")
+        if rs is not None:
+            try:
+                rsv = int(rs)
+                if rsv < 1: rsv = 1
+                if rsv > 5: rsv = 5
+                data["risk_score"] = rsv
+            except Exception:
+                data["risk_score"] = None
+
         return json.dumps(data, ensure_ascii=False)
 
     def _parse_and_validate(self, content: Optional[str]) -> AnalysisResult:

@@ -157,9 +157,18 @@ class AnalysisCard(QFrame):
         if bb:
             lbl = QLabel("BBand（布林）：")
             layout.addWidget(lbl, row, 0)
+            
             lines = []
+            tags = []
+            
+            if get(bb, "squeeze", None):
+                tags.append("擠壓")
+            pb = get(bb, "percent_b", None) or get(bb, "%b", None)
+            if pb is not None and (float(pb) >= 0.9 or float(pb) <= 0.1):
+                tags.append("貼邊")
+
             if get(bb, "period", None) or get(bb, "dev", None):
-                lines.append(f"參數：{get(bb,'period','?')}/{get(bb,'dev','?')}")
+                lines.append(f"參數：{get(bb,'period','?')}/{get(bb,'dev','?')} " + (f"[{' '.join(tags)}]" if tags else ""))
             ma = get(bb, "ma", None)
             up = get(bb, "upper", None)
             lo = get(bb, "lower", None)
@@ -172,7 +181,6 @@ class AnalysisCard(QFrame):
             width = get(bb, "width", None)
             if width is not None:
                 lines.append(f"帶寬：{fmt_pct(width)}")
-            pb = get(bb, "percent_b", None) or get(bb, "%b", None)
             if pb is not None:
                 try:
                     pbv = float(pb)
@@ -180,12 +188,13 @@ class AnalysisCard(QFrame):
                 except Exception:
                     pass
             sq = get(bb, "squeeze", None)
-            if sq is not None:
+            if sq is not None and not tags: # 如果已在參數行顯示 tag，這裡可省略
                 sqtxt = "狹縮" if sq else "非狹縮"
                 r = get(bb, "squeeze_rank_1y", None)
                 if r is not None:
                     sqtxt += f"（近1年分位≈{fmt_pct(r)}）"
                 lines.append(sqtxt)
+
             note = (get(bb, "note", "") or "").strip()
             if note:
                 lines.append(note)

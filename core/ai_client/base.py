@@ -52,8 +52,8 @@ SYSTEM_PROMPT = """
   - **擠壓量化**：`squeeze=true` 的條件為 `width` 處於近期低點（如 `bandwidth_rank_session < 0.2`）且 MA20 走平。
   - `note`：用 1~2 句說明「走帶/擠壓/均值回歸/突破」型態與交易含義。
 - **判讀與出場指引**：
-  - **走帶（walking the band）**：標準為「**連續3根K棒**收盤貼近上/下軌（如 %B > 0.8 或 < 0.2），且**量能同步驗證**」。**出場規則**：順勢分段出場，直到價格**明確收盤跌破/站上中軌**為止。
-  - **擠壓（squeeze）**：帶寬壓縮，預備突破。**策略切換**：在計畫中註明，一旦擠壓後出現**帶量突破**，策略應從**均值回歸（反轉）切換為順勢追蹤**。
+  - **走帶（walking the band）**：嚴格標準為「**連續 3 根 K 棒**收盤貼近上/下軌（如 %B > 0.8 或 < 0.2），且**量能同步或放大驗證**」。**出場規則**：順勢分段出場，直到價格**明確收盤跌破/站上中軌**為止。
+  - **擠壓（squeeze）**：帶寬壓縮，預備突破。**量化標準**：`bandwidth_rank_session < 0.2`。**策略切換**：在計畫中註明，一旦擠壓後出現**帶量突破**，策略應從**均值回歸（反轉）切換為順勢追蹤**。
   - **均值回歸（mean reversion）**：%B 觸及 0 或 1 且量能鈍化。**出場規則**：以**中軌/MVWAP** 為主要回歸目標。
   - **假突破**：標準為「價格衝出軌道但**收盤回帶內**，且**量能背離**（未顯著放大），**隔根K棒未延續**方向」。可反向短打，停損設於影線外緣。
 
@@ -470,6 +470,47 @@ class AIClientBase(ABC):
             except Exception:
                 data["risk_score"] = None
 
+        # ---- chip_score (float to int) ----
+        cs = data.get("chip_score")
+        if isinstance(cs, float):
+            data["chip_score"] = round(cs)
+
+        # ---- BBand 正規化/回補 ----
+        bband = data.get("bband")
+        if isinstance(bband, dict):
+            # 接受 "%b" 與 "percent_b"
+            if bband.get("%b") is None and bband.get("percent_b") is not None:
+                bband["%b"] = bband.pop("percent_b")
+
+            # 回補 width
+            if bband.get("width") is None:
+                upper = _to_float(bband.get("upper"))
+                lower = _to_float(bband.get("lower"))
+                ma = _to_float(bband.get("ma"))
+                if all(v is not None for v in [upper, lower, ma]):
+                    if ma > 1e-6:
+                        bband["width"] = (upper - lower) / ma
+                    else:
+                        bband.setdefault("note", "")
+                        bband["note"] += " (中軌為零無法計算帶寬)"
+
+            # 由 rank 推斷 squeeze
+            if bband.get("squeeze") is None:
+                rank = _to_float(bband.get("bandwidth_rank_session"))
+                if rank is not None and rank < 0.20:
+                    bband["squeeze"] = True
+
+            # 依 %b 註記走帶可能性
+            percent_b = _to_float(bband.get("%b"))
+            if percent_b is not None:
+                note = bband.get("note", "") or ""
+                if "走帶" not in note:
+                    if percent_b >= 0.9:
+                        bband.setdefault("note", "")
+                        bband["note"] += " (疑似貼上軌走帶)"
+                    elif percent_b <= 0.1:
+                        bband.setdefault("note", "")
+                        bband["note"] += " (疑似貼下軌走帶)"
         return json.dumps(data, ensure_ascii=False)
 
     def _parse_and_validate(self, content: Optional[str]) -> AnalysisResult:

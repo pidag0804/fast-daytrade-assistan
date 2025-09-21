@@ -63,16 +63,23 @@ class OpenAIClient(AIClientBase):
                 logger.error(f"Error reading image file {path}: {e}")
                 raise
         
-        return {
+        payload = {
             "model": model,
             "response_format": {"type": "json_object"}, # OpenAI specific JSON enforcement
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": content}
             ],
-            "max_tokens": 1000,
             "temperature": 0.2 # Low temperature for analytical tasks
         }
+        
+        # FIX: Handle different token parameter names for newer models
+        if "gpt-4o" in model or "gpt-5" in model:
+            payload["max_tokens"] = 4096 # Newer models often use this name and have higher limits
+        else:
+            payload["max_tokens"] = 1000
+            
+        return payload
 
     def _encode_image(self, path: str) -> Tuple[str, str]:
         mime_type = mimetypes.guess_type(path)[0] or 'image/webp'

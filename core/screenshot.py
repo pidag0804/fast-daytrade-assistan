@@ -14,19 +14,16 @@ win32gui = None
 wintypes = None
 Structure = None
 byref = None
+sizeof = None # ADDED: sizeof needs to be imported
 
 # Platform specific initialization
 if sys.platform == "win32":
     try:
         import win32gui
         # We still need ctypes for the DWM API calls (DwmGetWindowAttribute)
-        from ctypes import windll, wintypes, Structure, byref
+        # FIX: Explicitly import sizeof
+        from ctypes import windll, wintypes, Structure, byref, sizeof
         
-        # --- FIX: Removed manual DPI awareness setting here ---
-        # We rely on Qt (set up in app.py or by default) to handle DPI awareness correctly.
-        # Manually setting it here (e.g., windll.shcore.SetProcessDpiAwareness(2)) 
-        # used to conflict with Qt's initialization and cause "Access Denied" errors.
-
     except ImportError:
         logger.warning("pywin32 or ctypes imports failed. Active window capture will be less accurate on Windows.")
         # Ensure they remain None if import fails
@@ -85,8 +82,8 @@ def _capture_active_window_win32() -> np.ndarray | None:
         # This requires the process to be DPI aware, which Qt handles for us.
         try:
             # Ensure required ctypes components (wintypes, Structure, byref) are loaded
-            if not (wintypes and Structure and byref):
-                raise ImportError("ctypes components (wintypes/Structure/byref) failed to load.")
+            if not (wintypes and Structure and byref and sizeof):
+                raise ImportError("ctypes components (wintypes/Structure/byref/sizeof) failed to load.")
 
             DWMWA_EXTENDED_FRAME_BOUNDS = 9
             rect = wintypes.RECT()
@@ -94,7 +91,8 @@ def _capture_active_window_win32() -> np.ndarray | None:
             # Ensure dwmapi is loaded and the function exists before calling it
             if hasattr(windll, 'dwmapi') and hasattr(windll.dwmapi, 'DwmGetWindowAttribute'):
                 # DwmGetWindowAttribute requires byref for the RECT structure. Returns 0 on success.
-                if windll.dwmapi.DwmGetWindowAttribute(wintypes.HWND(hwnd), wintypes.DWORD(DWMWA_EXTENDED_FRAME_BOUNDS), byref(rect), wintypes.DWORD(Structure.sizeof(rect))) == 0:
+                # FIX: Changed Structure.sizeof(rect) to sizeof(rect)
+                if windll.dwmapi.DwmGetWindowAttribute(wintypes.HWND(hwnd), wintypes.DWORD(DWMWA_EXTENDED_FRAME_BOUNDS), byref(rect), wintypes.DWORD(sizeof(rect))) == 0:
                     x, y, x2, y2 = rect.left, rect.top, rect.right, rect.bottom
                 else:
                     raise OSError("DwmGetWindowAttribute call failed.")
